@@ -1,0 +1,2691 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Davjack
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Keep working in Claude Code on the Console API credit once the plan's limit is reached.
+
+The monthly API credit of a Max plan does not cover interactive Claude Code, but
+it covers `claude -p` run with an API key of the linked Console organization
+(billed as Agent SDK usage); a plain pay-as-you-go API account pays for the same
+calls. This script keeps one `claude -p` open for the whole run and streams the
+messages to it (`--input-format stream-json`, the Agent SDK's own mode): it
+starts or continues a session with its hooks, skills and CLAUDE.md, and hands it
+back to interactive Claude Code afterwards with `claude --resume <id>`.
+
+The run skips every permission prompt, so it loads the Bash firewall that sits
+next to the script (`hooks/bash-firewall.py`, with `hooks/hostio.py`) for its own
+run only, through `claude --settings`, and refuses to start without it. The
+user's own settings are left as they are.
+
+Usage, from the project directory:
+    claude-credit               start a new session
+    claude-credit -c            continue the most recent session of this directory
+    claude-credit -r            list this directory's sessions and pick one
+    claude-credit -r <id>       continue that session (--resume <id> works too)
+    claude-credit --budget 5    with any of the above: stop taking messages once this run cost 5 $
+
+-c and -r <id> ask before reloading a session above 300'000 tokens of context.
+
+A message sent while Claude works is passed on at once: Claude reads it as soon
+as the tool calls it is running finish, within the same turn, as in Claude Code.
+Esc or Ctrl+C interrupts the turn without ending the session; queued messages go
+next. `exit`, Ctrl+D on an empty input or Ctrl+C twice on an empty input ends the
+run. The plain display reads lines, not keys: there Ctrl+C interrupts a turn and,
+while Claude is idle, ends the run at once.
+
+Display: with python3-prompt-toolkit and python3-rich on a terminal, the
+transcript goes to the terminal's own scrollback (answers as rendered Markdown,
+the user's messages behind an orange bar, one line per action) above a live
+area, an input box and a status line; `/` lists the session's commands (Enter
+takes the first one, as in Claude Code), Up and Ctrl+R recall the messages
+typed in this directory, Ctrl+O prints the last action's full output. Without
+them, when a terminal is missing or with TERM=dumb, the plain display prints
+the answers and one line per tool call and reads one message per line (lines
+arriving together, a paste or a pipe, wait for an empty line or the end of
+input). Both end each turn with its cost and the
+context in use, end more than 30 s of work with a desktop notification
+(notify-send, when installed) and, on a terminal other than TERM=dumb, show ✻
+in the window title while Claude works, ✓ once it is done.
+
+Stdlib only, plus python3-rich and python3-prompt-toolkit when they are
+installed. The API key is pasted at launch and never enters the shell, so
+interactive sessions keep using the subscription. It does reach the commands
+Claude runs during the session: Claude Code only scrubs it from subprocesses in
+a mode that is incompatible with bypass permissions.
+
+So on Linux (5.3 and later) nothing the session started outlives the run: the
+script forks at once, and its first process, the guardian, waits above the run
+as a child subreaper, so that orphans come back to it rather than to init.
+However the run ends (exit, an error, a signal, kill -9), the guardian then ends
+every process still below it (claude, a command left in the background, an
+orphan of `cmd &`; not the children it had before `exec claude-credit`):
+SIGTERM with SIGCONT, then SIGKILL 5 s later, saying so when it has to wait. It
+names them on stderr, sets the terminal back to the mode it found, and exits
+with the run's code (128 + N after signal N). Any signal another process sends
+it that would end it is passed on to the run, and so is a hangup; the
+keyboard's already reach both. Job control is not passed on: kill -STOP or
+-TSTP to the guardian alone stops only the guardian, while the run goes on (stop
+the process group, as Ctrl+Z does). During the run nothing changes: what a
+crashed claude left runs until the run ends. Limits: kill -9 of the guardian
+itself closes the run as a hangup would (claude ends) but sweeps nothing, and
+`pkill -9 -f claude-credit` kills both; a process handed to a service outside
+the tree (systemd-run, at, a tmux or screen server already running) is not
+below it; another user's process (sudo) cannot be signalled, and is named at
+once; one stuck in an uninterruptible system call is named after 10 s.
+Elsewhere, or without /proc, the run is unguarded, as before.
+"""
+
+import asyncio
+import collections
+import contextlib
+import ctypes
+import gc
+import getpass
+import hashlib
+import io
+import json
+import math
+import os
+import queue
+import re
+import select
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import uuid
+
+try:
+    from markdown_it import MarkdownIt
+    from rich import box
+    from rich.cells import cell_len
+    from rich.console import Console, Group
+    from rich.markdown import Heading, Markdown
+    from rich.panel import Panel
+    from rich.segment import Segment
+    from rich.spinner import Spinner
+    from rich.text import Text
+    from rich.theme import Theme
+    HAVE_RICH = True
+except ImportError:
+    HAVE_RICH = False
+
+try:
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.completion import Completer, Completion
+    from prompt_toolkit.filters import Condition, has_completions, has_focus, is_done
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, ScrollOffsets, VSplit, Window
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+    from prompt_toolkit.layout.margins import ScrollbarMargin
+    from prompt_toolkit.layout.menus import CompletionsMenuControl
+    from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.styles import Style
+    from prompt_toolkit.widgets import SearchToolbar
+    # The display uses the `dim` attribute throughout; a release that cannot parse it
+    # (Debian 13's 3.0.51) gets the plain view instead of a crash at start.
+    Style.from_dict({"probe": "dim"})
+    HAVE_PTK = True
+except (ImportError, ValueError):
+    HAVE_PTK = False
+
+CLAUDE = "claude"
+MODEL = "opus[1m]"
+MODEL_LABEL = "Opus 5.5"
+KEY_SOURCE = "ANTHROPIC_API_KEY"
+# The Bash firewall beside the script, found through the symlink an install puts on the PATH.
+HOOKS = os.path.join(os.path.dirname(os.path.realpath(__file__)), "hooks")
+FIREWALL = os.path.join(HOOKS, "bash-firewall.py")
+FIREWALL_FILES = (FIREWALL, os.path.join(HOOKS, "hostio.py"))
+# Opus 5.5, USD per million tokens: input, 5-minute cache write, 1-hour cache
+# write, cache read, output. Used when a result does not carry its own cost, and
+# for the reload cost of a session (its context written to the 1-hour cache).
+OPUS_PRICE = (4.0, 5.0, 8.0, 0.20, 20.0)
+BILLING_URL = "https://platform.claude.com/settings/billing"
+EXIT_WORDS = {"exit", "quit", "/exit", "/quit"}
+INIT_TIMEOUT = 30    # seconds claude has to answer `initialize`
+CLOSE_WAIT = 10      # seconds given to an interrupted turn, then to claude, at exit
+NOTIFY_AFTER = 30    # seconds of work after which the end is notified
+NOTIFY_WAIT = 1      # seconds the end of the run gives a notification still being sent
+RELOAD_CONFIRM = 300_000  # context tokens above which -c and -r <id> ask first (about 2.40 $)
+PICK_LIMIT = 20      # sessions listed by -r
+SWEEP_GRACE = 5      # seconds what a run left gets after SIGTERM before SIGKILL, as Claude Code gives its commands
+SIGNAL_TWIN = 0.2    # seconds within which a second SIGINT is the first one, relayed by the guardian
+PR_SET_PDEATHSIG, PR_SET_CHILD_SUBREAPER = 1, 36  # <linux/prctl.h>
+# What the guardian passes on to the run: every signal that would otherwise end the guardian
+# alone. Job control (stop, continue) stays the process group's, and SIGCHLD is its own.
+FORWARDED = signal.valid_signals() - {signal.SIGKILL, signal.SIGSTOP, signal.SIGTSTP, signal.SIGTTIN,
+                                      signal.SIGTTOU, signal.SIGCONT, signal.SIGCHLD, signal.SIGWINCH,
+                                      signal.SIGURG}
+USER_LINES = 6       # lines of a long message shown in the transcript
+DETAIL_MAX = 400     # lines Ctrl+O prints
+INPUT_LINES = 6      # height of the input box at most
+ORANGE = "#d97757"
+# Linux canonical-mode terminals cut input lines at 4095 bytes, newline included
+# (the plain display reads in that mode; the terminal display does not).
+TTY_LINE_MAX = 4095
+TABLE_RULE = re.compile(r"\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*")  # a table's |---|---| row
+SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+USAGE = """Utilisation, depuis le dossier du projet :
+    claude-credit               démarre une session neuve
+    claude-credit -c            reprend la dernière session de ce dossier (--continue)
+    claude-credit -r            liste les sessions de ce dossier pour en choisir une
+    claude-credit -r <numéro>   reprend cette session (--resume <numéro>)
+    claude-credit --budget 5    avec chacune : plus de message une fois 5 $ dépensés"""
+# Terminal escape sequences (CSI, OSC) and control characters other than tab and
+# newline: text from the stream is shown, never obeyed by the terminal.
+CONTROL = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+                     r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+DETAIL_KEYS = ("description", "command", "file_path", "pattern", "skill", "prompt")
+ACTION_KEYS = ("description", "command", "file_path", "pattern", "skill", "query", "url", "prompt")
+LABELS = {"Read": "Lecture", "Edit": "Modification", "MultiEdit": "Modification",
+          "Write": "Écriture", "NotebookEdit": "Modification", "Bash": "Commande",
+          "Agent": "Sous-agent", "Task": "Sous-agent"}
+FILE_TOOLS = {"Read", "Edit", "MultiEdit", "Write", "NotebookEdit"}
+AGENT_TOOLS = {"Agent", "Task"}  # `Task` is the subagent tool's former name
+TASK_GLYPHS = {"pending": ("☐", ""), "in_progress": ("◐", ORANGE),
+               "completed": ("☑", "green"), "deleted": ("⊘", "dim")}
+AGENT_ENDS = {"completed": "terminé", "failed": "en échec", "killed": "arrêté", "stopped": "arrêté"}
+REJECTED = "The user doesn't want to proceed with this tool use"  # a call an interrupt stopped
+OUTPUT_TAIL = 4  # last lines of a command's output
+DIFF_LINES = 12
+THINKING_LINES = 3
+SHORTEST = 16  # cells a too-long piece of an action line keeps
+Options = collections.namedtuple("Options", "mode session_id budget")
+Start = collections.namedtuple("Start", "session_id continue_last label info")
+SessionInfo = collections.namedtuple("SessionInfo", "id mtime first size")
+REFUSED_ACCOUNT = ("claude ne facturerait pas la clé API : rien n'a été envoyé,"
+                   " l'abonnement n'est pas touché.")
+REFUSED_TURN = "Ce tour n'utilisait pas la clé API : arrêté, l'abonnement n'est pas touché."
+
+
+def parse_args(argv):
+    """Return Options(mode, session_id, budget); mode is help, new, continue, resume or pick."""
+    mode, session_id, budget, args = "new", None, None, list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg in ("-h", "--help"):
+            return Options("help", None, None)
+        if arg in ("-c", "--continue", "-r", "--resume"):
+            if mode != "new":
+                raise ValueError("-c et -r ne vont pas ensemble, ni deux fois.")
+            if arg in ("-c", "--continue"):
+                mode = "continue"
+            elif args and not args[0].startswith("-"):
+                mode, session_id = "resume", args.pop(0)
+            else:
+                mode = "pick"
+        elif arg == "--budget" or arg.startswith("--budget="):
+            budget = parse_budget(arg.partition("=")[2] if "=" in arg else (args.pop(0) if args else ""))
+        elif arg == "--nouvelle":
+            raise ValueError("--nouvelle n'existe plus : claude-credit seul démarre une session neuve.")
+        elif SESSION_ID.fullmatch(arg):
+            raise ValueError(f"Pour reprendre cette session : claude-credit -r {arg}")
+        else:
+            raise ValueError("Argument non reconnu : " + arg)
+    return Options(mode, session_id, budget)
+
+
+def parse_budget(text):
+    """A spending cap in dollars: `5`, `2.5` or `2,5`."""
+    try:
+        value = float(text.replace(",", "."))
+    except ValueError:
+        value = 0.0
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("--budget attend un montant en dollars, par exemple : --budget 5")
+    return value
+
+
+def firewall_settings(python=None, firewall=None):
+    """The `--settings` JSON that runs the Bash firewall before each Bash call of this run.
+
+    Hooks given on the command line add to the user's own (measured on Claude Code 2.1.326),
+    so nothing in the user's settings changes, and the firewall holds for this run only. A
+    `disableAllHooks: true` in the user's or the project's settings would drop it as well
+    (measured too): the command line's `false` overrides theirs. Managed settings still win.
+    """
+    command = shlex.quote(python or sys.executable) + " " + shlex.quote(firewall or FIREWALL)
+    return json.dumps({"disableAllHooks": False, "hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": command, "timeout": 10}]}]}})
+
+
+def build_command(session_id=None, continue_last=False, thinking=True, budget=None):
+    """The `claude -p` invocation of the whole run: the messages arrive on its stdin."""
+    cmd = [CLAUDE, "-p", "--model", MODEL,
+           "--dangerously-skip-permissions", "--permission-prompts", "none",
+           "--settings", firewall_settings(),
+           "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+           "--include-partial-messages", "--replay-user-messages"]
+    if thinking:
+        # In -p the thinking text is empty unless asked for; the summary costs nothing more.
+        cmd += ["--thinking-display", "summarized"]
+    if session_id:
+        cmd += ["--resume", session_id]
+    elif continue_last:
+        cmd.append("--continue")
+    if budget:
+        cmd += ["--max-budget-usd", f"{budget:g}"]
+    return cmd
+
+
+def child_env(api_key, base=None):
+    """Environment of the child: the key, and a cache that outlives a pause."""
+    env = dict(os.environ if base is None else base)
+    env["ANTHROPIC_API_KEY"] = api_key
+    # With an API key the main conversation's cache lives 5 minutes by default;
+    # reading the answer and typing the next message often takes longer.
+    env["CLAUDE_CODE_PROMPT_CACHE_TTL"] = "1h"
+    # An API key disables the claude.ai connectors anyway; saying so up front
+    # silences the warning Claude Code otherwise prints on every turn.
+    env["ENABLE_CLAUDEAI_MCP_SERVERS"] = "false"
+    return env
+
+
+def estimate_cost(usage):
+    """USD cost of one run's main-conversation tokens at Opus rates."""
+    cache = usage.get("cache_creation") or {}
+    write_5m = cache.get("ephemeral_5m_input_tokens", 0)
+    write_1h = cache.get("ephemeral_1h_input_tokens", 0)
+    if not cache:
+        write_5m = usage.get("cache_creation_input_tokens", 0)
+    p_in, p_5m, p_1h, p_read, p_out = OPUS_PRICE
+    return (usage.get("input_tokens", 0) * p_in + write_5m * p_5m + write_1h * p_1h
+            + usage.get("cache_read_input_tokens", 0) * p_read
+            + usage.get("output_tokens", 0) * p_out) / 1e6
+
+
+def turn_cost(result, previous_total):
+    """Cost of the turn that produced `result`, from the cumulative total.
+
+    `total_cost_usd` is the process's cumulative total, so the difference with
+    the previous result is exact. When there is no usable previous total (first
+    result of a resumed session, which carries what the subscription spent) or
+    the total went down (/clear resets it), the turn is estimated from its tokens.
+    """
+    total = result.get("total_cost_usd")
+    if previous_total is not None and total is not None and total >= previous_total:
+        return total - previous_total
+    return estimate_cost(result.get("usage") or {})
+
+
+def result_cost(result, previous_total):
+    """Cost of one result: its own `model_usage_since_last_result` when claude sends it.
+
+    That map holds the exact cost of this result alone, also on a resumed
+    session (checked on 2.1.312); a refused message has an
+    empty one, and costs nothing. Older versions fall back to the total.
+    """
+    since = result.get("model_usage_since_last_result")
+    if isinstance(since, dict):
+        return sum((model or {}).get("costUSD") or 0 for model in since.values()
+                   if isinstance(model, dict))
+    return turn_cost(result, previous_total)
+
+
+def next_previous_total(result, previous_total):
+    """Baseline for the next result; a zeroed total (crash, startup error) is not one."""
+    return result.get("total_cost_usd") or previous_total
+
+
+def clean(text):
+    """`text` without terminal escape sequences or control characters (tab and newline stay)."""
+    return CONTROL.sub("", str(text))
+
+
+def tool_detail(params, keys=DETAIL_KEYS, width=90):
+    """The most telling parameter of a tool call, on one line."""
+    detail = next((params[key] for key in keys if params.get(key)), "")
+    detail = " ".join(str(detail).split())
+    return detail if len(detail) <= width else detail[:width - 3] + "..."
+
+
+def describe_tool(block):
+    """One short line for a tool call."""
+    return f"  · {block.get('name')} {tool_detail(block.get('input') or {})}".rstrip()
+
+
+def render_event(event):
+    """Lines to print for one stream-json event (subagents' inner work is hidden)."""
+    kind = event.get("type")
+    if kind == "assistant" and not event.get("parent_tool_use_id"):
+        lines = []
+        for block in event.get("message", {}).get("content", []):
+            if block.get("type") == "text" and block.get("text", "").strip():
+                lines.append(block["text"].strip())
+            elif block.get("type") == "tool_use":
+                lines.append(describe_tool(block))
+        return lines
+    if kind == "system" and event.get("subtype") == "api_retry":
+        return [f"  (nouvel essai {event.get('attempt')} : {event.get('error')})"]
+    return []
+
+
+def explain_error(result):
+    """French explanation of a failed turn."""
+    text = result.get("result") or "; ".join(result.get("errors") or [])
+    low = text.lower()
+    if "credit balance" in low:
+        return f"Crédit API épuisé ou pas encore arrivé. Solde : {BILLING_URL}"
+    if "invalid api key" in low or "x-api-key" in low:
+        return "Clé API refusée : vérifie-la dans la Console (API keys)."
+    if "no conversation found" in low:
+        return ("Session introuvable. Pour une session neuve : claude-credit ;"
+                " pour choisir parmi celles de ce dossier : claude-credit -r")
+    return text or "Erreur inconnue."
+
+
+def elapsed(seconds):
+    """`12 s` under a minute, `1 min 05 s` after."""
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    return f"{seconds // 60} min {seconds % 60:02d} s"
+
+
+def tokens(count):
+    """`517`, `24k`, `1M`, `1.5M`."""
+    if round(count / 1000) >= 1000:
+        return f"{count / 1_000_000:.1f}".rstrip("0").rstrip(".") + "M"
+    if count >= 1000:
+        return f"{round(count / 1000)}k"
+    return str(count)
+
+
+def plural(count, word):
+    """`1 ligne`, `4 lignes` (French: 0 and 1 are singular)."""
+    return f"{count} {word}{'s' if count > 1 else ''}"
+
+
+def footer_text(cost, spent, context=None):
+    """The end-of-turn line of both views."""
+    text = f"ce tour : {cost:.2f} $ · depuis le lancement : {spent:.2f} $"
+    if context:
+        used, window = context
+        text += f" · contexte : {context_text(used, window)}"
+    return text
+
+
+def context_text(used, window):
+    return f"{round(100 * used / window)} % ({tokens(used)} / {tokens(window)})"
+
+
+def context_tokens(usage):
+    """Tokens an API call read and wrote: the size of the context it saw."""
+    return int(sum(usage.get(key) for key in ("input_tokens", "cache_read_input_tokens",
+                                               "cache_creation_input_tokens", "output_tokens")
+                   if isinstance(usage.get(key), (int, float))))
+
+
+def context_share(result, model, usage):
+    """(tokens in the context, context window) at the end of the turn, or None.
+
+    The context is what the last main-conversation API call read and wrote;
+    `result.usage` adds up every call of the turn, so it is not the context size.
+    """
+    window = None
+    for key in ("modelUsage", "model_usage_since_last_result"):
+        window = window or ((result.get(key) or {}).get(model) or {}).get("contextWindow")
+    if not window or not usage:
+        return None
+    return context_tokens(usage), window
+
+
+def main_usage(event):
+    """Token usage carried by a main-conversation event, or None.
+
+    A message's `message_delta` comes after its `assistant` events, so the last
+    usage seen in a turn is the final one of its last API call.
+    """
+    if event.get("parent_tool_use_id"):
+        return None
+    if event.get("type") == "stream_event":
+        inner = event.get("event") or {}
+        return inner.get("usage") if inner.get("type") == "message_delta" else None
+    if event.get("type") == "assistant":
+        return (event.get("message") or {}).get("usage")
+    return None
+
+
+def short_path(path, cwd):
+    """A path relative to the working directory when inside it, `~/…` under home."""
+    path = str(path)
+    base = (cwd or "").rstrip("/")
+    if base and path.startswith(base + "/"):
+        return path[len(base) + 1:]
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + "/") else path
+
+
+def first_line(text, width=100):
+    """The first non-empty line of `text`, cut at `width` characters."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    line = (lines[0] + (" …" if len(lines) > 1 else "")) if lines else ""
+    return line if len(line) <= width else line[:width - 1] + "…"
+
+
+def result_text(content):
+    """The text of a tool result, whose content is a string or a list of blocks."""
+    if isinstance(content, list):
+        return "\n".join(block.get("text", "") for block in content
+                         if isinstance(block, dict) and block.get("type") == "text")
+    return str(content or "")
+
+
+def error_line(text):
+    """First line of a tool error, without Claude Code's wrapping."""
+    text = re.sub(r"</?tool_use_error>", "", text).strip()
+    return first_line(text[len("Error: "):] if text.startswith("Error: ") else text, 160)
+
+
+def done(ok, label, target="", *details):
+    """`✓ Label target details`, or `✗` when it failed."""
+    line = [("✓", "green") if ok else ("✗", "red"), (" " + label, "bold")]
+    if target:
+        line.append((" " + target, ""))
+    return line + list(details)
+
+
+# Sessions on disk, for -c, -r and the reload warning. Claude Code documents
+# where transcripts live (~/.claude/projects/<working directory with every
+# non-alphanumeric character as "-">/<session-id>.jsonl), not their lines: what
+# cannot be read is skipped and the size then shows as unknown.
+
+def projects_dir(cwd, env=None):
+    env = os.environ if env is None else env
+    base = env.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "projects", re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def list_sessions(cwd, env=None, limit=PICK_LIMIT):
+    """The directory's sessions that have a message, most recent first."""
+    folder = projects_dir(cwd, env)
+    try:
+        names = [name for name in os.listdir(folder) if name.endswith(".jsonl")]
+    except OSError:
+        return []
+    dated = []
+    for name in names:
+        try:
+            dated.append((os.path.getmtime(os.path.join(folder, name)), name))
+        except OSError:
+            pass
+    sessions = []
+    for mtime, name in sorted(dated, reverse=True):
+        first, size = read_transcript(os.path.join(folder, name))
+        if first is not None:
+            sessions.append(SessionInfo(name[:-len(".jsonl")], mtime, first, size))
+        if len(sessions) == limit:
+            break
+    return sessions
+
+
+def session_info(cwd, session_id, env=None):
+    """The SessionInfo of one session of the directory, or None without its transcript."""
+    path = os.path.join(projects_dir(cwd, env), session_id + ".jsonl")
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    first, size = read_transcript(path)
+    return SessionInfo(session_id, mtime, first, size)
+
+
+def read_transcript(path):
+    """(first message, context tokens at the last answer) of a transcript; None where unknown."""
+    first, size, cleared = None, None, False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict) or entry.get("isSidechain"):
+                    continue
+                message = entry.get("message")
+                message = message if isinstance(message, dict) else {}
+                if entry.get("type") == "user" and first is None and not entry.get("isMeta"):
+                    first = message_text(message.get("content"))
+                    if first == "/clear":
+                        # A session /clear started opens on it: its first message comes next.
+                        first, cleared = None, True
+                elif entry.get("type") == "assistant" and isinstance(message.get("usage"), dict):
+                    size = context_tokens(message["usage"]) or size  # an error message has a zeroed usage
+                elif entry.get("subtype") == "compact_boundary":
+                    # The last answer before it measured the context compaction just shrank.
+                    after = (entry.get("compactMetadata") or {}).get("postTokens")
+                    size = int(after) if isinstance(after, (int, float)) else None
+    except OSError:
+        return None, None
+    # A session holding only /clear stays listed: when it is the newest, it is the one -c resumes.
+    return ("/clear" if first is None and cleared else first), size
+
+
+def message_text(content):
+    """A user message as it was typed: `/skill args` for a skill, None for what was not typed."""
+    if isinstance(content, list):
+        content = next((block.get("text") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"), None)
+    if not isinstance(content, str) or not content.strip():
+        return None
+    command = re.search(r"<command-name>(.*?)</command-name>", content, re.S)
+    if command:
+        args =re.search(r"<command-args>(.*?)</command-args>", content, re.S)
+        return f"{command.group(1).strip()} {args.group(1).strip() if args else ''}".strip()
+    if content.startswith(("<local-command", "<command-", "Caveat:", "[Request interrupted")):
+        return None
+    return content.strip()
+
+
+def reload_cost(size):
+    """USD of the first message on a resumed session: its context written to the 1-hour cache."""
+    return size * OPUS_PRICE[2] / 1e6
+
+
+def describe_session(info):
+    """`29.10 14:47 · 357k tokens · ~2.86 $ · corrige le test` for the -r list and the banner."""
+    size = (f"{tokens(info.size)} tokens · ~{reload_cost(info.size):.2f} $" if info.size
+            else "taille inconnue")
+    return f"{time.strftime('%d.%m %H:%M', time.localtime(info.mtime))} · {size} · {clean(first_line(info.first, 60))}"
+
+
+def ask_line(question, fd=0):
+    """One line typed before the session starts, read byte by byte: input() would buffer
+    the lines that follow it, which belong to the session."""
+    sys.stdout.write(question)
+    sys.stdout.flush()
+    line = b""
+    while not line.endswith(b"\n"):
+        char = os.read(fd, 1)
+        if not char:
+            break
+        line += char
+    return line.decode("utf-8", "replace").strip()
+
+
+def choose_session(options, cwd, ask=ask_line, pick=None, out=print):
+    """The session the run starts on, or None when the user declined or picked none."""
+    if options.mode == "new":
+        return Start(None, False, "session neuve", None)
+    if options.mode == "pick":
+        sessions = list_sessions(cwd)
+        if not sessions:
+            out("Aucune session dans ce dossier. claude-credit seul en démarre une.")
+            return None
+        info = (pick or pick_session)(sessions)
+        if info is None:
+            out("Aucune session choisie.")
+            return None
+        return Start(info.id, False, f"session {info.id}", info)
+    if options.mode == "continue":
+        info, label = next(iter(list_sessions(cwd, limit=1)), None), "dernière session de ce dossier"
+    else:
+        info = session_info(cwd, options.session_id)
+        label = f"session {options.session_id}"
+    if info and info.size and info.size > RELOAD_CONFIRM and not confirm_reload(info, ask, out):
+        return None
+    # -c resumes by id the session whose size was shown; without a transcript, claude picks.
+    session_id = info.id if info else options.session_id
+    return Start(session_id, options.mode == "continue" and not session_id, label, info)
+
+
+def confirm_reload(info, ask=ask_line, out=print):
+    out(f"Cette session occupe {tokens(info.size)} tokens de contexte : la reprendre coûte"
+        f" environ {reload_cost(info.size):.2f} $ au premier message (rechargement du cache).")
+    return ask("La reprendre quand même ? [o/N] ").strip().lower() in ("o", "oui", "y", "yes")
+
+
+def pick_session(sessions):
+    """The session chosen in the list, or None."""
+    if HAVE_PTK and sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+        return pick_in_list(sessions)
+    print("Sessions de ce dossier, la plus récente en premier :")
+    for number, info in enumerate(sessions, 1):
+        print(f"  {number:2d}. {describe_session(info)}")
+    answer = ask_line("Numéro (Entrée seule : aucune) : ").strip()
+    # isdecimal(), not isdigit(): « ² » is a digit int() refuses.
+    return sessions[int(answer) - 1] if answer.isdecimal() and 0 < int(answer) <= len(sessions) else None
+
+
+def pick_in_list(sessions):
+    """↑/↓ and Enter in a list drawn below the cursor; Esc, q or Ctrl+C cancels."""
+    chosen = {"index": 0, "info": None}
+    keys = KeyBindings()
+
+    def move(step):
+        chosen["index"] = (chosen["index"] + step) % len(sessions)
+
+    keys.add("up")(lambda event: move(-1))
+    keys.add("down")(lambda event: move(1))
+
+    @keys.add("enter")
+    def _(event):
+        chosen["info"] = sessions[chosen["index"]]
+        event.app.exit()
+
+    for key in ("escape", "q", "c-c", "c-d"):
+        keys.add(key)(lambda event: event.app.exit())
+
+    def rows():
+        width = shutil.get_terminal_size().columns - 1
+        lines = [("class:hint", "Sessions de ce dossier (↑ ↓, Entrée reprend, Échap annule)\n")]
+        for number, info in enumerate(sessions):
+            style = "reverse" if number == chosen["index"] else ""
+            lines.append((style, (("❯ " if style else "  ") + describe_session(info))[:width]))
+            lines.append(("", "\n"))
+        return lines[:-1]
+
+    app = Application(layout=Layout(Window(FormattedTextControl(rows), dont_extend_height=True)),
+                      key_bindings=keys, full_screen=False, erase_when_done=True,
+                      style=Style.from_dict({"hint": "dim"}))
+    app.ttimeoutlen = app.timeoutlen = 0.05
+    app.run()
+    return chosen["info"]
+
+
+# History of the messages typed in a directory, across runs (terminal display only).
+
+def history_path(cwd, env=None):
+    env = os.environ if env is None else env
+    state = env.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state, "claude-credit", "history-" + hashlib.sha1(cwd.encode()).hexdigest())
+
+
+def history_allowed(text, previous):
+    """A message worth recalling: not empty, not a repeat, never one carrying a key."""
+    return bool(text.strip()) and "sk-ant-" not in text and text != previous
+
+
+if HAVE_PTK:
+    class CreditHistory(FileHistory):
+        """prompt_toolkit's file history, private to the user, that keeps no key and no repeat."""
+
+        def __init__(self, path):
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            os.close(os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600))
+            super().__init__(path)
+
+        def append_string(self, string):
+            previous = self._loaded_strings[0] if self._loaded_strings else None
+            if history_allowed(string, previous):
+                super().append_string(string)
+
+    class SlashCompleter(Completer):
+        """The session's commands, from `initialize`, at the start of the input."""
+
+        def __init__(self, commands):
+            self.commands = commands
+
+        def get_completions(self, document, complete_event):
+            word = document.text_before_cursor
+            for name, description, hint in slash_matches(self.commands, word):
+                meta = description if not hint else f"{hint} · {description}"
+                yield Completion("/" + name, start_position=-len(word), display="/" + name,
+                                 display_meta=first_line(meta, 70))
+
+
+def slash_matches(commands, text):
+    """(name, description, argument hint) of the commands `text` starts, when it is `/word` alone."""
+    if not re.fullmatch(r"/[^\s/]*", text):
+        return []
+    word = text[1:].lower()
+    matches = []
+    for command in commands or []:
+        name = str((command or {}).get("name") or "").lstrip("/")
+        if name and name.lower().startswith(word):
+            matches.append((name, command.get("description") or "", command.get("argumentHint") or ""))
+    return matches
+
+
+def notify(title, body):
+    """A desktop notification when notify-send exists; it never blocks nor fails the run.
+
+    Returns the thread that reaps notify-send, None without one.
+    """
+    command = shutil.which("notify-send")
+    if not command:
+        return None
+    try:
+        proc = subprocess.Popen([command, "--app-name=claude-credit", title, body], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None
+    reaper = threading.Thread(target=proc.wait, daemon=True)  # reaped without waiting for it here
+    reaper.start()
+    return reaper
+
+
+def title_sequence(busy, cwd):
+    """OSC 0: the window title (the pane title inside tmux), ✻ while Claude works, ✓ after."""
+    return f"\x1b]0;{'✻' if busy else '✓'} claude-credit · {clean(os.path.basename(cwd) or cwd)}\x07"
+
+
+class Actions:
+    """One line per action with its outcome, built from the stream's events.
+
+    A line is a list of (text, style) pairs, so this part needs no library and
+    the rich view only has to colour it. The full output or diff of the last
+    action is kept for Ctrl+O.
+    """
+
+    def __init__(self):
+        self.cwd = None
+        self.calls = {}      # tool_use id -> (name, input), until its result arrives
+        self.done = set()    # tool_use ids whose result arrived
+        self.agents = {}     # tool_use id -> subagent shown as started, not yet finished
+        self.finished = set()
+        self.tasks = {}      # task id -> subject, for TaskUpdate
+        self.todos = {}      # TodoWrite item -> status
+        self.detail = None   # (header line, [(text, style)]) of the last action with an output
+
+    def new_turn(self):
+        """Forget the calls an interrupted turn left without a result.
+
+        A background subagent outlives its turn: its end comes with a later notification.
+        """
+        self.calls.clear()
+        self.agents = {call_id: agent for call_id, agent in self.agents.items() if agent["background"]}
+
+    def event(self, event):
+        """Lines to print for one stream-json event (subagents' inner work is hidden)."""
+        kind = event.get("type")
+        if kind == "system":
+            if event.get("subtype") == "init":
+                self.cwd = event.get("cwd") or self.cwd
+            return self._task_event(event)
+        if event.get("parent_tool_use_id"):
+            return []
+        if kind == "stream_event":
+            inner = event.get("event") or {}
+            block = inner.get("content_block") or {}
+            if inner.get("type") == "content_block_start" and block.get("type") == "tool_use":
+                self._use(block)
+        elif kind == "assistant":
+            for block in (event.get("message") or {}).get("content") or []:
+                if block.get("type") == "tool_use":
+                    self._use(block)
+        elif kind == "user":
+            content = (event.get("message") or {}).get("content")
+            results = [block for block in content if isinstance(block, dict)
+                       and block.get("type") == "tool_result"] if isinstance(content, list) else []
+            # One `tool_use_result` per event: it belongs to its result only when alone.
+            extra = event.get("tool_use_result") if len(results) == 1 else None
+            return [line for block in results for line in self._result(block, extra)]
+        return []
+
+    def live_lines(self):
+        """Calls still running, and subagents with their progress."""
+        lines = []
+        for call_id, (name, params) in self.calls.items():
+            if name not in AGENT_TOOLS or call_id not in self.agents:
+                lines.append([("•", ORANGE), (" " + self._label(name), "bold"),
+                              (" " + self._target(name, params), "")])
+        for agent in self.agents.values():
+            lines.append([("↳", "cyan"), (" " + agent["description"], ""),
+                          (agent["progress"], "dim")])
+        return lines
+
+    def abandoned(self, exited=False):
+        """The calls still running when their turn ended (an interrupt, a crash): they were cut.
+
+        When claude `exited`, the subagents it still ran, in the background too, went with it.
+        """
+        lines = [done(False, self._label(name), self._target(name, params), (" · interrompue", "red"))
+                 for call_id, (name, params) in self.calls.items()
+                 if name not in AGENT_TOOLS or call_id not in self.agents]
+        if exited:
+            lines += [self._agent_finished(call_id, "killed", {}) for call_id in list(self.agents)]
+        self.new_turn()
+        return lines
+
+    def detail_lines(self, limit=DETAIL_MAX):
+        """The last action's header and its whole output or diff (cut at `limit` lines)."""
+        if not self.detail:
+            return []
+        header, lines = self.detail
+        shown = [[("    " + text, style)] for text, style in lines[:limit]]
+        if len(lines) > limit:
+            shown.append([(f"    … (+{plural(len(lines) - limit, 'ligne')})", "dim")])
+        return [header] + (shown or [[("    (aucune sortie)", "dim")]])
+
+    def _use(self, block):
+        if block.get("id") not in self.done:
+            self.calls[block.get("id")] = (block.get("name") or "?", block.get("input") or {})
+
+    def _label(self, name):
+        if name.startswith("mcp__"):
+            parts = name.split("__", 2)
+            return " · ".join(part for part in parts[1:] if part)
+        return LABELS.get(name, name)
+
+    def _target(self, name, params):
+        if name in FILE_TOOLS:
+            return short_path(params.get("file_path") or params.get("notebook_path") or "", self.cwd)
+        if name == "Bash":
+            return first_line(params.get("command"))
+        if name in AGENT_TOOLS:
+            return " · ".join(filter(None, (params.get("subagent_type"), params.get("description"))))
+        if name == "WebSearch" and params.get("query"):
+            return f'"{params["query"]}"'
+        return tool_detail(params, ACTION_KEYS, 100)
+
+    def _result(self, block, extra):
+        call_id = block.get("tool_use_id")
+        if call_id not in self.calls:
+            return []
+        name, params = self.calls.pop(call_id)
+        self.done.add(call_id)
+        ok, text = not block.get("is_error"), result_text(block.get("content"))
+        extra = extra if isinstance(extra, dict) else {}
+        label, target = self._label(name), self._target(name, params)
+        if text.startswith(REJECTED):
+            self.agents.pop(call_id, None)
+            return [done(False, label, target, (" · interrompue", "red"))]
+        if name in AGENT_TOOLS:
+            return self._agent_result(call_id, params, ok, text, extra)
+        if name == "Bash":
+            return self._bash(target, ok, text, extra)
+        if not ok:
+            return [self._keep(done(False, label, target, (" — " + error_line(text), "red")),
+                               [(line, "red") for line in text.splitlines()])]
+        if name in ("TaskCreate", "TaskUpdate", "TodoWrite"):
+            lines = self._task_result(name, params, extra)
+            return [done(True, label, target)] if lines is None else lines
+        if name == "Read":
+            count = (extra.get("file") or {}).get("numLines")
+            details = [(" · " + plural(count, "ligne"), "dim")] if count else []
+            return [done(True, label, target, *details)]
+        if name == "Write" and extra.get("type") == "create":
+            content = params.get("content") or extra.get("content") or ""
+            count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+            return [self._keep(done(True, "Création", target, (" · " + plural(count, "ligne"), "dim")),
+                               [("+" + line, "green") for line in content.splitlines()])]
+        if name in FILE_TOOLS and "structuredPatch" in extra:
+            return self._diff(target, extra.get("structuredPatch") or [])
+        return [done(True, label, target)]
+
+    def _keep(self, header, lines):
+        """Remember `lines` as the last action's full output; return its header."""
+        self.detail = (header, lines)
+        return header
+
+    def _bash(self, target, ok, text, extra):
+        output = text
+        if ok and "stdout" in extra:
+            output = "\n".join(part for part in (extra.get("stdout"), extra.get("stderr")) if part)
+        code = re.match(r"Exit code (-?\d+)\n?", output) if not ok else None
+        if code:
+            output = output[code.end():]
+        elif not ok and not extra.get("interrupted"):
+            header = done(False, "Commande", target, (" — " + error_line(text), "red"))
+            return [self._keep(header, [(line, "red") for line in text.splitlines()])]
+        status = (" · code " + code.group(1)) if code else ""
+        if extra.get("interrupted"):
+            ok, status = False, " · interrompue"
+        lines = [line.rstrip() for line in output.splitlines() if line.strip()]
+        hidden = len(lines) - OUTPUT_TAIL
+        tail = ([f"… +{plural(hidden, 'ligne')} · Ctrl+O"] if hidden > 0 else []) + lines[-OUTPUT_TAIL:]
+        header = done(ok, "Commande", target, (status, "red"))
+        self._keep(header, [(line.rstrip(), "") for line in output.rstrip("\n").splitlines()])
+        return [header] + [[("    " + line, "dim")] for line in tail]
+
+    def _diff(self, target, patch):
+        lines = []
+        for hunk in patch:
+            if lines:
+                lines.append("⋯")
+            lines += hunk.get("lines") or []
+        added = sum(1 for line in lines if line.startswith("+"))
+        removed = sum(1 for line in lines if line.startswith("-"))
+        colours = [(line, "green" if line.startswith("+") else "red" if line.startswith("-") else "dim")
+                   for line in lines]
+        shown = [[("    " + line, style)] for line, style in colours[:DIFF_LINES]]
+        if len(lines) > DIFF_LINES:
+            shown.append([(f"    … +{plural(len(lines) - DIFF_LINES, 'ligne')} · Ctrl+O", "dim")])
+        header = done(True, "Modification", target, ("  ", ""), (f"+{added}", "green"),
+                      (" ", ""), (f"−{removed}", "red"))
+        return [self._keep(header, colours)] + shown
+
+    def _task_result(self, name, params, extra):
+        """Checklist lines; None when the call changed no status (shown as a plain action)."""
+        if name == "TaskCreate":
+            task = extra.get("task") or {}
+            subject = task.get("subject") or params.get("subject") or ""
+            if task.get("id") is not None:
+                self.tasks[str(task["id"])] = subject
+            return [task_line("pending", subject)]
+        if name == "TaskUpdate":
+            task_id = str(params.get("taskId") or extra.get("taskId") or "")
+            if params.get("subject"):
+                self.tasks[task_id] = params["subject"]
+            status = (extra.get("statusChange") or {}).get("to") or params.get("status")
+            subject = self.tasks.get(task_id) or f"tâche {task_id}"
+            return [task_line(status, subject)] if status else None
+        todos = [item for item in params.get("todos") or [] if isinstance(item, dict)]
+        lines = [task_line(item.get("status"), item.get("content") or "") for item in todos
+                 if self.todos.get(item.get("content")) != item.get("status")]
+        self.todos = {item.get("content"): item.get("status") for item in todos}
+        return lines
+
+    def _task_event(self, event):
+        """Subagent start, progress and end, from Claude Code's task events.
+
+        Only subagents: a task without `subagent_type` (a background command)
+        reports through its own tool result.
+        """
+        subtype, call_id = event.get("subtype"), event.get("tool_use_id")
+        if (subtype == "task_started" and event.get("subagent_type")
+                and call_id not in self.agents and call_id not in self.finished):
+            return [self._agent_started(call_id, event["subagent_type"], event.get("description"),
+                                        event.get("is_backgrounded"))]
+        if subtype == "task_progress" and call_id in self.agents:
+            usage = event.get("usage") or {}
+            progress = [event.get("last_tool_name")]
+            if usage.get("tool_uses"):
+                progress.append(plural(usage["tool_uses"], "outil"))
+            self.agents[call_id]["progress"] = "".join(" · " + part for part in progress if part)
+        if subtype == "task_notification" and call_id in self.agents:
+            return [self._agent_finished(call_id, event.get("status"), event.get("usage") or {})]
+        return []
+
+    def _agent_started(self, call_id, kind, description, background=False):
+        if not description:
+            description = self.calls.get(call_id, (None, {}))[1].get("description")
+        self.agents[call_id] = {"description": description or "", "progress": "",
+                                "background": bool(background)}
+        return [("▸", "cyan"), (" Sous-agent", "bold"), (" " + (kind or ""), ""),
+                (" · " + (description or ""), "dim")]
+
+    def _agent_finished(self, call_id, status, usage, description=None):
+        self.finished.add(call_id)
+        description = (self.agents.pop(call_id, None) or {}).get("description") or description or ""
+        details = [description]
+        if usage.get("tool_uses") is not None:
+            details.append(plural(usage["tool_uses"], "outil"))
+        if usage.get("total_tokens"):
+            details.append(tokens(usage["total_tokens"]) + " tokens")
+        if usage.get("duration_ms") is not None:
+            details.append(elapsed(usage["duration_ms"] / 1000))
+        word = AGENT_ENDS.get(status, status or "terminé")
+        return done(status in (None, "completed"), "Sous-agent " + word, "",
+                    *[(" · " + detail, "dim") for detail in details if detail])
+
+    def _agent_result(self, call_id, params, ok, text, extra):
+        """The tool result stands in for the task events a version may not send."""
+        lines = []
+        if call_id not in self.agents and call_id not in self.finished:
+            lines.append(self._agent_started(call_id, params.get("subagent_type"), params.get("description"),
+                                             params.get("run_in_background")))
+        # In the background by request, by its definition (`background: true`) or by the harness.
+        background = (self.agents.get(call_id, {}).get("background") or params.get("run_in_background")
+                      or extra.get("status") == "async_launched")
+        if ok and background and call_id in self.agents:
+            self.agents[call_id]["background"] = True  # new_turn() keeps it until its notification
+        if call_id in self.finished or (ok and background):
+            return lines  # already finished, or its end comes with its notification
+        usage = {"tool_uses": extra.get("totalToolUseCount"), "total_tokens": extra.get("totalTokens"),
+                 "duration_ms": extra.get("totalDurationMs")}
+        lines.append(self._agent_finished(call_id, extra.get("status") if ok else "failed", usage,
+                                          params.get("description")))
+        if not ok:
+            lines.append([("    " + error_line(text), "red")])
+        return lines
+
+
+def task_line(status, subject):
+    glyph, style = TASK_GLYPHS.get(status, TASK_GLYPHS["pending"])
+    return [(glyph, style), (" " + subject, "dim" if status == "deleted" else "")]
+
+
+class PlainView:
+    """The display without rich: the answers and one line per tool call."""
+
+    def __init__(self, out=print, err=None, prompt=None):
+        self.out = out
+        self.err = err or (lambda line: print(line, file=sys.stderr))
+        self.prompt = prompt  # shown when Claude is done, on an interactive terminal
+        self.skip = (None, "")  # after a fallback: message id and text the failed view printed
+
+    def start(self):
+        pass
+
+    def stop(self, exited=False):
+        pass
+
+    def idle(self):
+        if self.prompt:
+            sys.stdout.write(self.prompt)
+            sys.stdout.flush()
+
+    def event(self, event):
+        for text in render_event(self._unshown(event)):
+            self.out(clean(text))
+
+    def _unshown(self, event):
+        """`event` without the start of its answer that the failed terminal view printed already."""
+        message_id, shown = self.skip
+        message = event.get("message") or {}
+        if not shown or event.get("type") != "assistant" or message.get("id") != message_id:
+            return event
+        self.skip = (None, "")
+        content = []
+        for block in message.get("content") or []:
+            text = clean(block.get("text") or "")
+            if shown and block.get("type") == "text" and text.startswith(shown):
+                block, shown = dict(block, text=text[len(shown):]), ""
+            content.append(block)
+        return dict(event, message=dict(message, content=content))
+
+    def user(self, text):
+        lines = clean(text).strip().split("\n")
+        for line in lines[:USER_LINES]:
+            self.out("> " + line)
+        if len(lines) > USER_LINES:
+            self.out(f"> … (+{plural(len(lines) - USER_LINES, 'ligne')})")
+
+    def note(self, text):
+        self.out(text)
+
+    def stderr(self, line):
+        self.err(line)
+
+    def footer(self, text):
+        self.out(f"  [{text}]")
+
+    def detail(self):
+        pass
+
+
+if HAVE_RICH:
+    # rich's parser configuration without raw HTML: rich renders an HTML token
+    # as nothing, so `claude-credit -r <id>` would lose its placeholder.
+    # Answer parses with it too, so blocks split where they render.
+    PARSER = MarkdownIt("commonmark", {"html": False}).enable("strikethrough").enable("table")
+    THEME = Theme({"markdown.h1": "bold underline", "markdown.h2": "bold",
+                   "markdown.code": "bold cyan"})
+
+    class LeftHeading(Heading):
+        """A heading as Claude Code shows it: left-aligned, no box."""
+
+        def __rich_console__(self, console, options):
+            self.text.justify = "left"
+            yield self.text
+
+    class Answer(Markdown):
+        elements = {**Markdown.elements, "heading_open": LeftHeading}
+
+        def __init__(self, text):
+            # ansi_dark draws with the terminal's own palette: readable on light and dark themes.
+            super().__init__("", code_theme="ansi_dark")
+            self.markup, self.parsed = text, PARSER.parse(text)
+
+        def __rich_console__(self, console, options):
+            # A list or a table rendered alone starts with the blank line that
+            # separates it from a previous block; the view does its own spacing.
+            segments = super().__rich_console__(console, options)
+            for segment in segments:
+                if segment.text != "\n":
+                    yield segment
+                    break
+            yield from segments
+
+    class Bottom:
+        """The last `height` lines of a renderable: the live area must fit above the input."""
+
+        def __init__(self, renderable, height):
+            self.renderable, self.height = renderable, height
+
+        def __rich_console__(self, console, options):
+            for line in console.render_lines(self.renderable, options, pad=False)[-self.height:]:
+                yield from line
+                yield Segment.line()
+
+
+def split_closed(tail):
+    """(closed, open): `tail` cut before its last top-level Markdown block.
+
+    Only the last block of a growing text can still change (a `|---|` line
+    turns a paragraph into a table), so everything before it can be printed for
+    good. Complete lines only: a half-received line may still open a block.
+    """
+    complete = tail[: tail.rfind("\n") + 1]
+    starts = [token.map[0] for token in PARSER.parse(complete)
+              if token.level == 0 and token.map and token.nesting != -1]
+    if len(starts) < 2:
+        return "", tail
+    # markdown-it counts lines at `\n` only; splitlines() would also cut at U+2028.
+    cut = sum(len(line) + 1 for line in complete.split("\n")[: starts[-1]])
+    return tail[:cut], tail[cut:]
+
+
+def live_tail(text, height):
+    """The last `height` lines of a long open code fence or table, for the live area.
+
+    Rendering the whole block at each refresh costs ~50 ms at 200 lines of code.
+    A fence keeps its opening line and a table its header and rule, so the rest
+    still renders as code or as a table; other blocks would change meaning if
+    cut, so they stay whole.
+    """
+    lines = text.split("\n")
+    if len(lines) <= height:
+        return text
+    if lines[0].lstrip().startswith(("```", "~~~")):
+        head = lines[:1]
+    elif len(lines) > 1 and TABLE_RULE.fullmatch(lines[1]):
+        head = lines[:2]
+    else:
+        return text
+    return "\n".join(head + lines[-height:])
+
+
+def rich_console(**options):
+    return Console(highlight=False, theme=THEME, **options)
+
+
+def styled(line, width):
+    """A line of (text, style) pairs as one rich Text, fitted to `width` cells when it can be.
+
+    Too wide, its longest pieces (a command, a path, an error) are shortened in
+    turn, down to SHORTEST cells each, so that what follows them (`· code 1`,
+    `+2 −1`) stays on screen.
+    """
+    pieces = [(clean(text).replace("\t", " "), style) for text, style in line]
+    over = sum(cell_len(text) for text, _ in pieces) - width
+    while over > 0:
+        index = max(range(len(pieces)), key=lambda n: cell_len(pieces[n][0]))
+        text, style = pieces[index]
+        size = cell_len(text)
+        if size <= SHORTEST:
+            break
+        pieces[index] = (shorten(text, max(size - over, SHORTEST)), style)
+        over -= size - cell_len(pieces[index][0])
+    return Text.assemble(*pieces, no_wrap=True, overflow="ellipsis")
+
+
+def shorten(text, cells):
+    """`text` cut to `cells` cells with an ellipsis: a path keeps its end (the file name),
+    anything else its start."""
+    body = text.lstrip()
+    lead = text[: len(text) - len(body)]
+    path = "/" in body and " " not in body
+    budget, kept = cells - cell_len(lead) - 1, ""
+    for char in reversed(body) if path else body:
+        budget -= cell_len(char)
+        if budget < 0:
+            break
+        kept = char + kept if path else kept + char
+    return lead + ("…" + kept if path else kept + "…")
+
+
+def to_ansi(renderable, width, color_system):
+    """`renderable` as terminal text for prompt_toolkit's ANSI, which cannot parse OSC links."""
+    capture = Console(file=io.StringIO(), force_terminal=True, color_system=color_system,
+                      width=max(width, 20), highlight=False, theme=THEME)
+    capture.print(renderable, end="")
+    return OSC.sub("", capture.file.getvalue()).rstrip("\n")
+
+
+class RichView:
+    """Streamed Markdown, collapsed thinking, one line per action, the user's messages marked.
+
+    What is final is printed through `console` (above the input box, into the
+    terminal's scrollback); what can still change (the open Markdown block,
+    running actions, the time spent) is drawn by `live_renderable`, which the
+    terminal display redraws ten times a second. Both run on the display's thread.
+    """
+
+    def __init__(self, console):
+        self.console = console
+        self.actions = Actions()
+        self.detailed = None    # the detail Ctrl+O printed last
+        self.last = None        # "block" or "line": what was printed last, for spacing
+        self.spinner = Spinner("dots", style=ORANGE)
+        self._reset()
+
+    def _reset(self):
+        self.began = time.monotonic()
+        self.blocks = {}        # index -> type of the blocks of the message being streamed
+        self.streamed = set()   # message ids whose text and thinking arrive as deltas
+        self.tail = ""          # the open Markdown of the text block being streamed
+        self.message = None     # id of the message being printed
+        self.shown = ""         # what is printed for good of its text block (a fallback skips it)
+        self.thinking = ""
+
+    def start(self):
+        """A turn starts: Claude is working."""
+        self._reset()
+        self.actions.new_turn()
+
+    def stop(self, exited=False):
+        """The turn ended: its last text goes out, and what still ran was cut (see `abandoned`)."""
+        self._flush_text()
+        self._flush_thinking()
+        self._lines(self.actions.abandoned(exited))
+
+    def idle(self):
+        pass
+
+    def event(self, event):
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "api_retry":
+            for text in render_event(event):
+                self.note(text)
+        elif kind == "stream_event" and not event.get("parent_tool_use_id"):
+            self._stream(event.get("event") or {}, event.get("api_message_id"))
+        elif kind == "assistant" and not event.get("parent_tool_use_id"):
+            self._assistant(event.get("message") or {})
+        self._lines(self.actions.event(event))
+
+    def user(self, text):
+        """The user's message: an orange bar and bold text on each line, a long paste cut."""
+        self._flush_text()
+        self._flush_thinking()
+        lines = clean(text).strip("\n").replace("\t", "    ").split("\n")
+        rows = []
+        for line in lines[:USER_LINES]:
+            wrapped = Text(line, style="bold").wrap(self.console, max(self.console.width - 2, 10))
+            rows += [Text.assemble(("▌ ", ORANGE), row) for row in wrapped] or [Text("▌", style=ORANGE)]
+        if len(lines) > USER_LINES:
+            rows.append(Text.assemble(("▌ ", ORANGE),
+                                      (f"… (+{plural(len(lines) - USER_LINES, 'ligne')})", "dim")))
+        self._print("block", *rows)
+        self.last = "user"  # the next block, a line too, keeps a blank line after it
+
+    def note(self, text):
+        self._print("line", Text(clean(text).strip(), style="bold"))
+
+    def stderr(self, line):
+        self._print("line", Text(clean(line), style="dim"))
+
+    def footer(self, text):
+        self._print("block", Text("  " + text, style="dim"))
+
+    def detail(self):
+        """Ctrl+O: the last action's full output or diff."""
+        lines = self.actions.detail_lines()
+        if not lines:
+            self.note("  (aucune action à détailler pour l'instant)")
+            return
+        if self.actions.detail is self.detailed:
+            self.note("  (sortie complète déjà affichée plus haut)")
+            return
+        self.detailed = self.actions.detail
+        self._print("block", *(Text.assemble(*[(clean(text).replace("\t", "    "), style) for text, style in line])
+                               for line in lines))
+
+    def live_renderable(self, height):
+        """The live area: what is still open, running actions, then the time spent."""
+        parts = []
+        if self.tail.strip():
+            # Room left for a long table's header and rule, and the lines below the block.
+            parts += [Answer(live_tail(self.tail, max(height - 6, 3))), Text("")]
+        elif self.thinking.strip():
+            thought = self.thinking.strip().splitlines()[-1]
+            parts += [Text("∴ " + thought, style="dim italic", no_wrap=True, overflow="ellipsis"), Text("")]
+        lines = self.actions.live_lines()
+        if lines:
+            parts += [styled(line, self.console.width) for line in lines] + [Text("")]
+        self.spinner.update(text=Text.assemble(f"Claude travaille… {elapsed(time.monotonic() - self.began)}",
+                                               (" · Échap interrompt", "dim")))
+        return Bottom(Group(*parts, self.spinner), max(height, 1))
+
+    def _stream(self, inner, message_id):
+        kind = inner.get("type")
+        if kind == "message_start":
+            self.message = message_id or (inner.get("message") or {}).get("id")
+            self.streamed.add(self.message)
+            self.blocks = {}
+        elif kind == "content_block_start":
+            self.blocks[inner.get("index")] = (inner.get("content_block") or {}).get("type")
+            self.shown = ""
+        elif kind == "content_block_delta":
+            delta = inner.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                self._text(delta.get("text") or "")
+            elif delta.get("type") == "thinking_delta":
+                self.thinking += clean(delta.get("thinking") or "")
+        elif kind == "content_block_stop":
+            block = self.blocks.get(inner.get("index"))
+            if block == "text":
+                self._flush_text()
+            elif block == "thinking":
+                self._flush_thinking()
+
+    def _assistant(self, message):
+        """Text and thinking that did not arrive as deltas come whole here."""
+        if message.get("id") in self.streamed:
+            return
+        self.message = message.get("id")
+        for block in message.get("content") or []:
+            if block.get("type") == "text":
+                self.shown = ""
+                self._text(block.get("text") or "")
+                self._flush_text()
+            elif block.get("type") == "thinking":
+                self.thinking = clean(block.get("thinking") or "")
+                self._flush_thinking()
+
+    def _text(self, delta):
+        self.tail += clean(delta)
+        if "\n" not in delta:
+            return  # no new complete line: no block can have closed
+        self._answer(*split_closed(self.tail))
+
+    def _flush_text(self):
+        self._answer(self.tail, "")
+
+    def _answer(self, closed, rest):
+        """Print `closed` for good while `rest` stays open in the live area."""
+        self.tail = rest  # before printing: the live area must not show it too
+        try:
+            if closed.strip():
+                self._print("block", Answer(closed))
+        except Exception:
+            # A rendering bug: the view falls back to plain text, which no
+            # longer has this block; it goes out raw before the fallback.
+            self.console.print(Text(closed))
+            self.shown += closed
+            raise
+        self.shown += closed
+
+    def _flush_thinking(self):
+        text, self.thinking = self.thinking, ""
+        if not text.strip():
+            return  # nothing to show: the live area already says Claude is working
+        rows = Text(text.strip(), style="dim italic").wrap(self.console, self.console.width - 2)
+        rows = [row for row in rows if row.plain.strip()]
+        shown = [Text.assemble("  ", row) for row in rows[:THINKING_LINES]]
+        if len(rows) > THINKING_LINES:
+            shown.append(Text(f"  … (+{plural(len(rows) - THINKING_LINES, 'ligne')})", style="dim"))
+        self._print("block", Text("∴ Réflexion", style="dim"), *shown)
+
+    def _lines(self, lines):
+        if lines:
+            self._print("line", *(styled(line, self.console.width) for line in lines))
+
+    def _print(self, kind, *renderables):
+        """Print for good; blank lines separate all but consecutive lines."""
+        spacing = [] if kind == "line" and self.last == "line" else [Text("")]
+        self.last = kind
+        self.console.print(Group(*spacing, *renderables))
+
+
+def make_view():
+    """The terminal display where prompt_toolkit and rich can run it, the plain one anywhere else."""
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if HAVE_RICH and HAVE_PTK and interactive:
+        console = rich_console()
+        if console.is_terminal and not console.is_dumb_terminal:
+            # Under prompt_toolkit, stdout becomes a proxy that prints above the input box.
+            return RichView(rich_console(force_terminal=True))
+    return PlainView(prompt="\ncredit> " if interactive else None)
+
+
+def read_message(fd=0):
+    """Read one message (plain display). Returns None at end of input, "" for nothing to send.
+
+    A typed line is sent on Enter. A pasted block of several lines arrives at
+    once; it is sent only after an empty line, so its last line (which may have
+    no newline yet) and an instruction typed after it belong to the message.
+    """
+    buf, hinted = b"", False
+    while True:
+        data = os.read(fd, 65536)
+        if not data:
+            return buf.decode("utf-8", "replace").strip() if buf else None
+        buf += data
+        if select.select([fd], [], [], 0.05)[0]:
+            continue
+        if os.isatty(fd) and any(len(line) >= TTY_LINE_MAX - 1 for line in buf.split(b"\n")):
+            sys.stdout.write("  Ligne trop longue pour le terminal (plus de 4'000 caractères) :"
+                             " message ignoré. Mets ce contenu dans un fichier et donne son chemin.\n")
+            return ""
+        text = buf.decode("utf-8", "replace")
+        if text.endswith("\n") and text.count("\n") == 1:
+            return text.strip()
+        if text.endswith("\n\n"):
+            return text.strip()
+        if not hinted:
+            sys.stdout.write("  (plusieurs lignes : une ligne vide envoie le message)\n")
+            sys.stdout.flush()
+            hinted = True
+
+
+def show(views, action, *args):
+    """Call the view; a display bug switches the rest of the run to the plain view."""
+    try:
+        getattr(views[0], action)(*args)
+    except Exception as err:
+        if isinstance(views[0], PlainView):
+            raise
+        fall_back(views, err)
+        if action not in ("start", "stop", "idle", "detail"):
+            getattr(views[0], action)(*args)
+
+
+def fall_back(views, err):
+    """The rest of the run in the plain view, after a display bug."""
+    failed, views[0] = views[0], PlainView()
+    try:
+        failed.stop()
+    except Exception:
+        pass
+    # The answer it was streaming arrives whole for the plain view: only its rest is printed then.
+    views[0].skip = (getattr(failed, "message", None), getattr(failed, "shown", ""))
+    views[0].note(f"  (affichage simplifié pour la suite : {err})")
+
+
+class Session:
+    """The run's one `claude -p` process, spoken to in stream-json.
+
+    Its reader threads turn claude's output into items for `post`:
+    ("event", event), ("stderr", line), ("ready", info), ("refused",) with its
+    reason in `refused`, ("note", text) and ("exit", code). The key checks and the session id live
+    here, on the reader thread, never in a view: a display bug can neither bill
+    the subscription nor lose the session.
+    """
+
+    def __init__(self, env, post, session_id=None, continue_last=False, thinking=True, budget=None):
+        self.env, self.post = env, post
+        self.session_id, self.continue_last = session_id, continue_last
+        self.thinking, self.budget = thinking, budget
+        self.proc = None
+        self.lock = threading.RLock()  # stdin writes, and the hand-over of held messages
+        self.ready = threading.Event()
+        self.held = []          # messages sent before `initialize` answered
+        self.refused = None     # why it was stopped, once a key check failed
+        self.exited = False
+        self.closing = False
+        self.info = {}          # the `initialize` response
+        self.last_result = None
+        self.stderr_lines = collections.deque(maxlen=40)
+        self.starts = 0
+        self.requests = 0
+
+    @property
+    def alive(self):
+        return self.proc is not None and not self.exited
+
+    def command(self):
+        return build_command(self.session_id, self.continue_last, self.thinking, self.budget)
+
+    def start(self):
+        """Start claude and send `initialize`; messages wait until its answer passes the key check."""
+        self.ready.clear()
+        self.exited, self.refused, self.last_result = False, None, None
+        self.starts += 1
+        self.init_id = f"init-{self.starts}"
+        # Its own process group: no terminal signal reaches it, everything goes through the protocol.
+        # errors="replace": one invalid byte must not stop the reading (and fill the pipe).
+        proc = subprocess.Popen(self.command(), env=self.env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                errors="replace", start_new_session=True)
+        self.proc = proc
+        stderr_done, own_stderr = threading.Event(), []
+        threading.Thread(target=self._read_stderr, args=(proc, own_stderr, stderr_done), daemon=True).start()
+        threading.Thread(target=self._read_stdout, args=(proc, own_stderr, stderr_done), daemon=True).start()
+        self._write(proc, {"type": "control_request", "request_id": self.init_id,
+                           "request": {"subtype": "initialize"}})
+
+    def send(self, message_id, text):
+        line = {"type": "user", "message": {"role": "user", "content": text},
+                "parent_tool_use_id": None, "uuid": message_id}
+        with self.lock:
+            if not self.ready.is_set():
+                self.held.append(line)
+                return
+            self._write(self.proc, line)
+
+    def cancel_held(self):
+        """Drop the messages waiting for `initialize`; False once they have left."""
+        with self.lock:
+            if self.ready.is_set():
+                return False
+            self.held = []
+            return True
+
+    def interrupt(self, cancel_queued=False):
+        """Stop the running turn; queued messages go next unless `cancel_queued`."""
+        self.requests += 1
+        request = {"subtype": "interrupt"}
+        if cancel_queued:
+            request["cancel_queued"] = True
+        self._write(self.proc, {"type": "control_request", "request_id": f"interrupt-{self.requests}",
+                                "request": request})
+
+    def close(self, wait=CLOSE_WAIT):
+        """Close stdin, let claude end (`wait` s), then terminate its process group."""
+        with self.lock:
+            self.closing = True
+            self.held = []  # waiting for `initialize`: they must not leave after the user quit
+            proc = self.proc  # with `closing`: a reader starting claude again holds the lock
+        if proc is None:
+            return None
+        with self.lock:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            proc.wait(wait)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            pass
+        self._kill(proc)  # claude, if it still runs, and what it left in its process group
+        try:
+            return proc.wait(5)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            self._kill(proc, signal.SIGKILL)
+            return None
+
+    def _write(self, proc, message):
+        with self.lock:
+            try:
+                proc.stdin.write(json.dumps(message) + "\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass  # claude is gone: its reader reports the exit
+
+    def _kill(self, proc, sig=signal.SIGTERM):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _read_stderr(self, proc, lines, done):
+        for line in proc.stderr:
+            lines.append(line)
+            self.stderr_lines.append(line)
+            self.post(("stderr", line.rstrip("\n")))
+        proc.stderr.close()
+        done.set()
+
+    def _read_stdout(self, proc, stderr, stderr_done):
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and proc is self.proc and not self._check(proc, event):
+                self.post(("event", event))
+        proc.stdout.close()
+        code = proc.wait()
+        # What it left in its process group (an LSP server) dies with it: a later claude replaces
+        # self.proc, the one close() ends. Bash commands run detached, in groups of their own.
+        self._kill(proc)
+        stderr_done.wait(2)  # a command that left its process group may hold the pipe open
+        with self.lock:
+            try:
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+            if proc is not self.proc:
+                return
+            # Decided and started under the lock: close() then ends either this claude or the next.
+            if (not self.ready.is_set() and self.thinking and not self.closing and not self.refused
+                    and "--thinking-display" in "".join(stderr)):
+                # An older claude refuses the option before any API call: start again without it.
+                self.thinking = False
+                self.post(("note", "  option --thinking-display refusée par cette version de claude :"
+                                   " réflexion masquée"))
+                self.start()
+                return
+            self.exited = True
+            self.held = []  # never sent: the conversation lists them as unread
+        self.post(("exit", code))
+
+    def _check(self, proc, event):
+        """The key checks and the session id; True when the event is consumed here."""
+        kind = event.get("type")
+        if kind == "control_response":
+            response = event.get("response") or {}
+            if response.get("request_id") != self.init_id:
+                return False  # an interrupt receipt: the conversation reads it
+            info = response.get("response") or {}
+            if response.get("subtype") != "success":
+                # Not a verdict on billing: say what claude answered.
+                error = first_line(clean(str(response.get("error") or "sans détail")), 200)
+                self.refused = f"claude a refusé de démarrer ({error}) : rien n'a été envoyé."
+            elif (info.get("account") or {}).get("apiKeySource") != KEY_SOURCE:
+                self.refused = REFUSED_ACCOUNT
+            if self.refused:
+                self._kill(proc)
+                self.post(("refused",))
+                return True
+            with self.lock:
+                self.info = info
+                self.ready.set()
+                held, self.held = ([] if self.closing else self.held), []
+                for line in held:
+                    self._write(proc, line)
+            self.post(("ready", info))
+            return True
+        if kind == "system" and event.get("subtype") == "init":
+            if event.get("apiKeySource") != KEY_SOURCE:
+                self.refused = REFUSED_TURN
+                self._kill(proc)
+                self.post(("refused",))
+                return True
+            self.session_id = event.get("session_id") or self.session_id
+        elif kind == "result":
+            self.last_result = event
+            if not self.ready.is_set():
+                # claude could not start (an unknown session): it held no message, its exit says why.
+                return True
+            self.session_id = event.get("session_id") or self.session_id
+        return False
+
+
+class Conversation:
+    """What is sent, queued, shown and spent, the same for both displays.
+
+    Items arrive on `inbox`: from the session's reader threads, from the plain
+    display's keyboard thread ("input", "eof"), from SIGINT ("ctrl-c") and from
+    SIGTERM or SIGHUP ("hangup"); the terminal display hands its "input" to
+    `handle` directly, on the loop that drains the inbox. `handle` runs on one
+    thread only. Busy means a turn runs, or a message Claude has not read yet
+    will start one.
+    """
+
+    def __init__(self, session, view, inbox, budget=None, new=False, notify_after=NOTIFY_AFTER,
+                 cwd=None, title=None):
+        self.session, self.views, self.inbox = session, [view], inbox
+        self.budget, self.notify_after, self.title = budget, notify_after, title
+        self.cwd = cwd or os.getcwd()
+        self.texts = {}         # message uuid -> text, as typed
+        self.pending = []       # uuids sent and not read by Claude yet, in order
+        self.printed = set()    # uuids already in the transcript
+        self.running = False
+        self.began = None       # start of the current stretch of work
+        self.interrupting = False
+        self.capped = False
+        self.eof = self.stop_requested = False
+        self.titled = None
+        self.stopped = False    # claude exited: the next message starts it again
+        self.restarted = False  # claude started again after it stopped: say so once it answers
+        self.spent = 0.0
+        # A new session starts at zero, so even its first result's cost is exact.
+        self.previous_total = 0.0 if new else None
+        self.model = self.usage = self.context = None
+        self.notifying = []     # threads reaping a notify-send: close() gives them NOTIFY_WAIT
+
+    @property
+    def busy(self):
+        return self.running or bool(self.pending)
+
+    @property
+    def queued(self):
+        """Texts sent while Claude worked and not read yet, oldest first."""
+        return [self.texts[uid] for uid in self.pending if uid not in self.printed]
+
+    @property
+    def finished(self):
+        return self.stop_requested or (self.eof and not self.busy)
+
+    def drain(self):
+        """Handle every item waiting; True if there was one."""
+        handled = False
+        while True:
+            try:
+                item = self.inbox.get_nowait()
+            except queue.Empty:
+                return handled
+            self.handle(item)
+            handled = True
+
+    def handle(self, item):
+        """Handle one item; False for an input not taken (the terminal display keeps it in its box)."""
+        kind, taken = item[0], True
+        if kind == "event":
+            self.event(item[1])
+        elif kind == "stderr":
+            show(self.views, "stderr", item[1])
+        elif kind == "note":
+            show(self.views, "note", item[1])
+        elif kind == "input":
+            if self.stop_requested:
+                pass  # typed once quitting began: nothing more goes to claude
+            elif item[1].strip().lower() in EXIT_WORDS:
+                self.stop_requested = True
+            else:
+                taken = self.send(item[1])
+        elif kind == "eof":
+            self.eof = True
+        elif kind == "ctrl-c":
+            if self.busy:
+                self.interrupt()
+            else:
+                self.stop_requested = True
+        elif kind == "hangup":
+            self.stop_requested = True  # the terminal closed or a kill: end the run as `exit` would
+        elif kind == "ready" and self.restarted:
+            self.restarted = False
+            show(self.views, "note", f"  (claude relancé sur la session {self.session.session_id})")
+        elif kind == "refused":
+            self._lost(self.session.refused)
+        elif kind == "exit" and not self.session.closing and not self.session.refused:
+            self.stopped = True
+            note = f"  claude s'est arrêté (code {item[1]})."
+            if not self.session.ready.is_set() and self.session.last_result:
+                note += " " + explain_error(self.session.last_result)  # it could not start again
+            elif self.session.session_id:
+                note += " Le prochain message relance la session."
+            self._lost(note)
+        self._title()
+        return taken
+
+    def send(self, text):
+        """Send `text` to Claude; False when it cannot take it (said in the transcript)."""
+        if self.capped:
+            show(self.views, "note", "  Plafond atteint : Claude ne prend plus de message. « exit » quitte.")
+            return False
+        if self.session.refused:
+            show(self.views, "note", "  " + self.session.refused + " « exit » quitte.")
+            return False
+        # Restart once its exit was handled: a message sent just before is listed as unread then.
+        if self.stopped:
+            if not self.session.session_id:
+                show(self.views, "note", "  claude ne tourne plus et aucune session n'est à reprendre."
+                                         " « exit » quitte.")
+                return False
+            if self.budget:
+                # claude's cap counts its own process's spend: the new one gets what is left.
+                left = self.budget - self.spent
+                if left <= 0:
+                    self.capped = True
+                    show(self.views, "note", "  Plafond atteint : Claude ne prend plus de message."
+                                             " « exit » quitte.")
+                    return False
+                self.session.budget = left
+            try:
+                self.session.start()  # resumes by id; the message waits for the key check
+            except OSError as err:
+                show(self.views, "note", f"  claude ne peut pas être relancé : {err}")
+                return False
+            self.stopped, self.restarted = False, True
+            # The new claude's first total carries what the resumed session spent: no baseline yet.
+            self.previous_total = None
+        message_id = str(uuid.uuid4())
+        self.texts[message_id] = text
+        if not self.busy:
+            # Claude is idle: the message opens a turn and goes into the transcript now.
+            self.printed.add(message_id)
+            show(self.views, "user", text)
+            self._begin()
+        self.pending.append(message_id)
+        self.session.send(message_id, text)
+        self._title()
+        return True
+
+    def interrupt(self):
+        if not self.busy or not self.session.alive:
+            return
+        if self.session.cancel_held():
+            # claude is starting again: what it holds never left, so dropping it is the interrupt.
+            self._lost("(tour interrompu)")
+            return
+        self.interrupting = True
+        self.session.interrupt()  # its result says "(tour interrompu)"
+
+    def detail(self):
+        show(self.views, "detail")
+
+    def close(self, wait=CLOSE_WAIT):
+        """End the run: an interrupted turn and queued messages cancelled, then claude closed."""
+        try:
+            # A message still waiting for `initialize` is dropped by close() below; an interrupt
+            # before claude answered would find no turn to stop.
+            if self.session.alive and self.session.ready.is_set() and self.busy:
+                self.interrupting = True
+                self.session.interrupt(cancel_queued=True)
+                show(self.views, "note", "  (interruption avant de quitter…)")
+                self._wait(lambda: not self.running, wait)
+        finally:
+            # Once the terminal is gone every print fails: claude is closed all the same.
+            self.session.close(wait)
+        self.drain()
+        if self.running:
+            self.running = False
+            show(self.views, "stop")
+        self.pending = []  # cancelled with claude, even when it did not answer the interrupt
+        self._title()      # so quitting always ends on ✓
+        # Still running once the run has ended, notify-send would be ended by the guardian, its
+        # notification lost, and named among what the session left (a turn quit sends one).
+        deadline = time.monotonic() + NOTIFY_WAIT
+        for reaper in self.notifying:
+            reaper.join(max(0, deadline - time.monotonic()))
+
+    def _wait(self, condition, timeout):
+        deadline = time.monotonic() + timeout
+        while not condition():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            try:
+                item = self.inbox.get(timeout=min(left, 0.1))
+            except queue.Empty:
+                continue
+            if item[0] == "ctrl-c":
+                return
+            self.handle(item)
+
+    def event(self, event):
+        kind = event.get("type")
+        if kind == "system" and event.get("subtype") == "init":
+            self.model = event.get("model") or self.model
+            if not self.running:
+                self._begin()  # a queued message starts its own turn
+        elif kind == "user" and event.get("isReplay"):
+            self._read(event.get("uuid"))
+            return  # the replay of a skill carries its expansion: the transcript shows what was typed
+        elif kind == "result":
+            self._result(event)
+            return
+        elif kind == "control_response":
+            cancelled = ((event.get("response") or {}).get("response") or {}).get("cancelled") or []
+            self.pending = [uid for uid in self.pending if uid not in cancelled]
+            return
+        elif kind == "conversation_reset":
+            self.context = self.usage = None  # /clear: the old context is gone
+        self.usage = main_usage(event) or self.usage
+        show(self.views, "event", event)
+
+    def _begin(self):
+        self.running = True
+        self.began = self.began or time.monotonic()
+        show(self.views, "start")
+
+    def _read(self, message_id):
+        """Claude read this message: out of the queue, into the transcript (once)."""
+        if message_id in self.pending:
+            self.pending.remove(message_id)
+        if message_id in self.texts and message_id not in self.printed:
+            self.printed.add(message_id)
+            show(self.views, "user", self.texts[message_id])
+
+    def _result(self, result):
+        # Once capped, claude refuses unread what was queued during the turn that reached the cap.
+        refused = self.capped and result.get("subtype") == "error_max_budget_usd"
+        for message_id in result.get("user_message_uuids") or []:
+            if refused and message_id in self.pending and message_id not in self.printed:
+                self.pending.remove(message_id)
+                self._unread("Non lu par Claude (plafond atteint)", [message_id])
+            else:
+                self._read(message_id)  # the message that opened the turn, if it was never replayed
+        # The message that opened the turn was read by now, replayed or not: never stay busy on it.
+        self.pending = [uid for uid in self.pending if uid not in self.printed]
+        cost = result_cost(result, self.previous_total)
+        self.previous_total = next_previous_total(result, self.previous_total)
+        self.spent += cost
+        self.context = context_share(result, self.model, self.usage) or self.context
+        show(self.views, "stop")
+        if result.get("subtype") == "error_max_budget_usd":
+            if not refused:  # said once: claude's later refusals cost nothing
+                self.capped = True
+                show(self.views, "note", f"  Plafond de {self.budget or 0:g} $ atteint ({self.spent:.2f} $) :"
+                                         " Claude ne prend plus de message.")
+        elif self.interrupting and result.get("subtype") == "error_during_execution":
+            show(self.views, "note", "  (tour interrompu)")
+        elif result.get("is_error"):
+            show(self.views, "note", "  " + explain_error(result))
+        self.interrupting = False
+        if not refused:
+            show(self.views, "footer", footer_text(cost, self.spent, self.context))
+        self.running = False
+        if not self.busy:
+            self._idle()
+
+    def _lost(self, note):
+        """claude stopped or was stopped: no turn runs, nothing it had will be read."""
+        unread, self.pending = self.pending, []
+        self.interrupting = False  # an interrupt it never answered
+        self.running = False
+        show(self.views, "stop", True)  # its turn, if one ran, and its background subagents
+        show(self.views, "note", "  " + note.strip())
+        # The next message restarts claude on its session, unless it was refused or has none.
+        self._unread("Non lu par Claude, à renvoyer" if self.session.session_id and not self.session.refused
+                     else "Non lu par Claude", unread)
+        self._idle()
+
+    def _unread(self, label, message_ids):
+        for message_id in message_ids:
+            show(self.views, "note", f"  {label} : « {first_line(self.texts[message_id], 70)} »")
+
+    def _idle(self):
+        if self.began is not None and time.monotonic() - self.began >= self.notify_after:
+            reaper = notify("claude-credit", f"Claude a fini ({elapsed(time.monotonic() - self.began)})"
+                                             f" · {os.path.basename(self.cwd) or self.cwd}")
+            if reaper:
+                self.notifying.append(reaper)
+        self.began = None
+        self._title()
+        show(self.views, "idle")
+
+    def _title(self):
+        if self.title and self.titled != self.busy:
+            self.titled = self.busy
+            try:
+                self.title(self.busy)
+            except Exception:
+                pass
+
+
+def read_lines(fd, inbox):
+    """The plain display's keyboard (or pipe): each message read goes to the inbox."""
+    try:
+        while True:
+            message = read_message(fd)
+            if message is None:
+                break
+            if message:
+                inbox.put(("input", message))
+    except OSError:
+        pass
+    inbox.put(("eof",))
+
+
+def run_plain(conversation, fd=0):
+    """The plain display's loop: messages typed (or piped) and claude's output, in arrival order."""
+    threading.Thread(target=read_lines, args=(fd, conversation.inbox), daemon=True).start()
+    while not conversation.finished:
+        try:
+            # Bounded: CPython runs a signal handler between bytecodes, so a signal that lands
+            # just before this thread waits would be seen only once the next item arrives.
+            item = conversation.inbox.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        conversation.handle(item)
+
+
+if HAVE_PTK:
+    class TerminalUI:
+        """The terminal display: the transcript above, then the live area, the queue,
+        the input box, the command menu and the status line, all at the bottom."""
+
+        # The terminal's own colours, no background, dim rather than bright black (which
+        # some dark themes paint like the background): readable on light and dark themes
+        # alike (prompt_toolkit's default menu is black on grey).
+        STYLE = Style.from_dict({
+            "border": "dim", "prompt": "bold", "status": "dim", "queued": "dim italic",
+            "completion-menu": "fg:default bg:default",
+            "completion-menu.completion": "fg:default bg:default",
+            "completion-menu.completion.current": "fg:default bg:default reverse",
+            "completion-menu.meta.completion": "fg:default bg:default dim",
+            "completion-menu.meta.completion.current": "fg:default bg:default reverse",
+            "scrollbar.background": "bg:default", "scrollbar.button": "fg:default bg:default reverse"})
+
+        def __init__(self, conversation, commands, history=None):
+            self.conversation = conversation
+            self.ctrl_c_at = 0.0
+            self.app = None
+            self.buffer = Buffer(multiline=True, history=history,
+                                 completer=SlashCompleter(list(commands or [])), complete_while_typing=True)
+            # Ctrl+R shows the match while it is typed, whatever its case: a message
+            # often starts with a capital.
+            self.search = SearchToolbar(backward_search_prompt="Recherche dans l'historique : ",
+                                        forward_search_prompt="Recherche en avant : ", ignore_case=True)
+
+        def run(self):
+            asyncio.run(self._main())
+
+        async def _main(self):
+            with patch_stdout(raw=True):
+                self.app = self._application()
+                self.conversation.title = self._set_title
+                pump = asyncio.get_running_loop().create_task(self._pump())
+                try:
+                    # Its SIGINT handler would swallow a `kill -INT`; ours turns it into an item.
+                    await self.app.run_async(handle_sigint=False)
+                finally:
+                    pump.cancel()  # the title stays: quitting while busy still ends on ✓
+
+        async def _pump(self):
+            try:
+                while True:
+                    if self.conversation.drain():
+                        self.app.invalidate()
+                    if self.conversation.finished:
+                        self.app.exit()
+                        return
+                    await asyncio.sleep(0.03)
+            except Exception as err:
+                # Nothing would read the keys or the signals any more: end the display, and
+                # main() still closes claude and prints the session lines.
+                self.app.exit(exception=err)
+
+        def _set_title(self, busy):
+            self.app.output.write_raw(title_sequence(busy, self.conversation.cwd))
+            self.app.output.flush()
+
+        def _application(self):
+            input_window = Window(
+                BufferControl(self.buffer, search_buffer_control=self.search.control, preview_search=True),
+                get_line_prefix=lambda line, wrap: [("class:prompt", "❯ " if line == 0 and wrap == 0 else "  ")],
+                wrap_lines=True, height=Dimension(min=1, max=INPUT_LINES), dont_extend_height=True)
+            busy = Condition(lambda: self.conversation.busy)
+            root = HSplit([
+                ConditionalContainer(Window(FormattedTextControl(self._live), dont_extend_height=True),
+                                     filter=busy),
+                ConditionalContainer(Window(FormattedTextControl(self._queued), dont_extend_height=True),
+                                     filter=Condition(lambda: bool(self.conversation.queued))),
+                rounded(VSplit([Window(width=1), input_window, Window(width=1)])),
+                # The command menu, as tall as its entries: the app keeps its tallest height
+                # during the run, and a menu that may grow would fill it.
+                ConditionalContainer(Window(CompletionsMenuControl(), height=Dimension(min=1, max=8),
+                                            dont_extend_height=True, scroll_offsets=ScrollOffsets(top=1, bottom=1),
+                                            right_margins=[ScrollbarMargin()]),
+                                     filter=has_completions & ~is_done),
+                self.search,
+                Window(FormattedTextControl(self._status), height=1, style="class:status"),
+            ])
+            app = Application(layout=Layout(root, focused_element=input_window),
+                              key_bindings=self._keys(), style=self.STYLE, full_screen=False,
+                              erase_when_done=True, refresh_interval=0.1, mouse_support=False)
+            # A lone Esc must not wait for an Alt sequence: 50 ms, then it interrupts.
+            app.ttimeoutlen = app.timeoutlen = 0.05
+            return app
+
+        def _keys(self):
+            keys = KeyBindings()
+            typing = has_focus(self.buffer)
+            busy = Condition(lambda: self.conversation.busy)
+            empty = Condition(lambda: not self.buffer.text)
+
+            @keys.add("enter", filter=typing)
+            def _(event):
+                if self.buffer.document.text_before_cursor.endswith("\\"):
+                    self.buffer.delete_before_cursor(1)
+                    self.buffer.insert_text("\n")
+                    return
+                menu = self.buffer.complete_state
+                if menu and menu.completions and not any(c.text == self.buffer.text for c in menu.completions):
+                    # As in Claude Code, Enter on the menu takes the command shown first (or picked).
+                    self.buffer.apply_completion(menu.current_completion or menu.completions[0])
+                text = self.buffer.text.strip("\n")
+                if not text.strip() or not self.conversation.handle(("input", text)):
+                    return  # not taken (cap reached, key refused): it stays in the box
+                self.buffer.append_to_history()
+                self.buffer.reset()
+                self.ctrl_c_at = 0.0
+
+            @keys.add("escape", "enter", filter=typing)
+            @keys.add("c-j", filter=typing)
+            def _(event):
+                self.buffer.insert_text("\n")
+
+            @keys.add("escape", filter=typing & has_completions)
+            def _(event):
+                self.buffer.cancel_completion()  # the menu closes first, as in Claude Code
+
+            @keys.add("escape", filter=typing & busy & ~has_completions)
+            def _(event):
+                self.conversation.interrupt()
+
+            @keys.add("c-c", filter=typing)
+            def _(event):
+                if self.conversation.busy:
+                    self.conversation.interrupt()
+                elif self.buffer.text:
+                    self.buffer.reset()
+                elif time.monotonic() - self.ctrl_c_at < 2:
+                    self.conversation.stop_requested = True
+                else:
+                    self.ctrl_c_at = time.monotonic()
+
+            @keys.add("c-d", filter=typing & empty)
+            def _(event):
+                self.conversation.stop_requested = True
+
+            @keys.add("c-l")
+            def _(event):
+                event.app.renderer.clear()
+
+            @keys.add("c-o")
+            def _(event):
+                self.conversation.detail()
+
+            return keys
+
+        def _columns(self):
+            return self.app.output.get_size().columns if self.app else shutil.get_terminal_size().columns
+
+        def _live(self):
+            view = self.conversation.views[0]
+            if not isinstance(view, RichView) or not self.conversation.busy:
+                return ""
+            try:
+                return self._live_text(view)
+            except Exception as err:
+                # prompt_toolkit calls this itself: show() is not around it, and an error
+                # here would stop the whole display at every refresh.
+                fall_back(self.conversation.views, err)
+                return ""
+
+        def _live_text(self, view):
+            size = self.app.output.get_size()
+            lines = min(self.buffer.document.line_count, INPUT_LINES)
+            menu = min(len(self.buffer.complete_state.completions), 8) if self.buffer.complete_state else 0
+            height = size.rows - lines - 3 - len(self.conversation.queued) - menu - 1
+            # Half the screen at most: a frame taller than that is left in the scrollback
+            # when the terminal shrinks (seen in tmux), and the transcript stays in view.
+            height = min(height, size.rows // 2)
+            return ANSI(to_ansi(view.live_renderable(max(height, 1)), size.columns,
+                                view.console.color_system))
+
+        def _queued(self):
+            return [("class:queued", "\n".join("  en attente : " + first_line(text, self._columns() - 18)
+                                               for text in self.conversation.queued))]
+
+        def _status(self):
+            conversation = self.conversation
+            parts = [MODEL_LABEL]
+            if conversation.context:
+                parts.append("contexte " + context_text(*conversation.context))
+            budget = f" / {conversation.budget:g}" if conversation.budget else ""
+            parts.append(f"séance {conversation.spent:.2f}{budget} $")
+            if conversation.queued:
+                parts.append(f"{len(conversation.queued)} en attente")
+            info = " " + " · ".join(parts)
+            # The key hint on the right, shortened, or left out on a narrow terminal.
+            room = self._columns() - len(info) - 3
+            hint = next((hint for hint in self._hints() if len(hint) <= room), "")
+            return [("class:status", info + " " * max(room - len(hint) + 2, 1) + hint)]
+
+        def _hints(self):
+            """The key hint of the moment, from its full form to its shortest."""
+            if time.monotonic() - self.ctrl_c_at < 2:
+                return ["Ctrl+C encore pour quitter"]
+            if self.conversation.capped:
+                return ["plafond atteint · Ctrl+D quitte", "Ctrl+D quitte"]
+            if self.conversation.busy:
+                return ["Entrée met en attente · Échap interrompt", "Échap interrompt"]
+            view = self.conversation.views[0]
+            detail = " · Ctrl+O détail" if getattr(getattr(view, "actions", None), "detail", None) else ""
+            return [f"\\ + Entrée nouvelle ligne{detail} · Ctrl+D quitte",
+                    "\\ + Entrée nouvelle ligne · Ctrl+D quitte", "Ctrl+D quitte"]
+
+    def rounded(body):
+        """`body` in a box with rounded corners."""
+        def edge(left, right):
+            return VSplit([Window(width=1, height=1, char=left, style="class:border"),
+                           Window(height=1, char="─", style="class:border"),
+                           Window(width=1, height=1, char=right, style="class:border")])
+        side = Window(width=1, char="│", style="class:border")
+        return HSplit([edge("╭", "╮"), VSplit([side, body, side]), edge("╰", "╯")])
+
+
+def banner(view, start, info, budget=None):
+    """The opening box: what runs, where, on which session."""
+    cwd = short_path(os.getcwd(), None)
+    if isinstance(view, RichView):
+        cwd = shorten(cwd, max(view.console.width - 6, 20)) if cell_len(cwd) > view.console.width - 6 else cwd
+    version = info.get("claude_code_version")
+    details = [cwd, " · ".join(filter(None, [start.label, budget and f"plafond {budget:g} $",
+                                             version and f"Claude Code {version}"]))]
+    if start.info:
+        details.append(describe_session(start.info))
+    if isinstance(view, RichView):
+        body = Text.assemble(("✻ ", ORANGE), ("claude-credit", "bold"), " · crédit API · ", MODEL_LABEL,
+                             *[("\n" + clean(detail), "dim") for detail in details])
+        view.console.print(Panel(body, box=box.ROUNDED, border_style=ORANGE, expand=False, padding=(0, 1)))
+        view.console.print(Text("  Écris même pendant que Claude travaille · Échap l'interrompt"
+                                " · / commandes · ↑ historique", style="dim"))
+    else:
+        print(f"claude-credit · crédit API · {MODEL_LABEL} · " + " · ".join(details))
+        print("Une ligne envoie un message, même pendant que Claude travaille · Ctrl+C interrompt"
+              " · « exit » quitte.")
+
+
+def wait_ready(session, timeout=INIT_TIMEOUT):
+    """None once claude answered `initialize` for the key, else why the run cannot start."""
+    deadline = time.monotonic() + timeout
+    while not session.ready.wait(0.05):
+        if session.refused:
+            return session.refused
+        if session.exited:
+            if session.last_result:
+                return explain_error(session.last_result)
+            tail = "".join(list(session.stderr_lines)[-5:]).strip()
+            return f"claude n'a pas pu démarrer (code {session.proc.returncode})." + ("\n" + tail if tail else "")
+        if time.monotonic() > deadline:
+            return f"claude n'a pas répondu en {timeout} s : rien n'a été envoyé."
+    return None
+
+
+def get_api_key():
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    print("Colle ta clé API de la Console Anthropic (sk-ant-api…), puis Entrée. Elle ne s'affiche pas.")
+    return getpass.getpass("Clé : ").strip()
+
+
+def signal_items(inbox):
+    """The handler that turns SIGINT, SIGTERM and SIGHUP into inbox items.
+
+    A `kill -INT` to the process group reaches the run twice, directly and relayed by the
+    guardian: a SIGINT within SIGNAL_TWIN of the last one taken is that same one.
+    """
+    taken = [-math.inf]
+
+    def handler(number, _frame):
+        if number == signal.SIGINT:
+            now = time.monotonic()
+            if now - taken[0] < SIGNAL_TWIN:
+                return
+            taken[0] = now
+        inbox.put(("ctrl-c",) if number == signal.SIGINT else ("hangup",))
+    return handler
+
+
+def main(argv):
+    try:
+        options = parse_args(argv)
+    except ValueError as err:
+        print(err)
+        print(USAGE)
+        return 2
+    if options.mode == "help":
+        print(USAGE)
+        return 0
+    # The firewall is the only floor under --dangerously-skip-permissions, and a hook that cannot
+    # start is a non-blocking error in Claude Code: a missing file would disable it silently.
+    for path in FIREWALL_FILES:
+        if not os.path.isfile(path):
+            print(f"Pare-feu introuvable : {path}\nSans lui, claude-credit ne démarre pas :"
+                  " réinstalle claude-credit.")
+            return 1
+    cwd = os.getcwd()
+    start = choose_session(options, cwd)
+    if start is None:
+        return 0 if options.mode == "pick" else 1
+
+    api_key = get_api_key()
+    if not api_key.startswith("sk-ant-") or api_key.startswith("sk-ant-oat"):
+        print("Ce n'est pas une clé API de la Console Anthropic (elle commence par sk-ant-api).")
+        return 1
+    # SimpleQueue: its put() is safe in a signal handler, where Queue.put can deadlock on its lock.
+    inbox = queue.SimpleQueue()
+    session = Session(child_env(api_key), inbox.put, start.session_id, start.continue_last,
+                      budget=options.budget)
+    # On a terminal this line gives way to the banner once claude answers.
+    erase = "\r\x1b[2K" if sys.stdout.isatty() and os.environ.get("TERM") != "dumb" else ""
+    print("Démarrage de claude…", end="" if erase else "\n", flush=True)
+    try:
+        session.start()
+    except OSError as err:
+        print(f"{erase}claude ne peut pas être lancé : {err}")
+        return 1
+    try:
+        failure = wait_ready(session)
+    except KeyboardInterrupt:
+        session.close(0)
+        raise
+    print(erase, end="", flush=True)
+    if failure:
+        session.close(0)
+        print(failure)
+        return 1
+
+    view = make_view()
+    conversation = Conversation(session, view, inbox, budget=options.budget,
+                                new=not (start.session_id or start.continue_last), cwd=cwd)
+    banner(view, start, session.info, options.budget)
+    # Signals become items like any other: never an exception in the middle of a print. claude
+    # has its own process group, so a closed terminal or a kill must end it from here, or its
+    # running turn would go on billing.
+    on_signal = signal_items(inbox)
+    stops = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    for number in stops:
+        signal.signal(number, on_signal)
+    try:
+        if isinstance(view, RichView):
+            history = None
+            try:
+                history = CreditHistory(history_path(cwd))
+            except OSError:
+                pass
+            TerminalUI(conversation, session.info.get("commands"), history).run()
+        else:
+            show(conversation.views, "idle")
+            if sys.stdout.isatty() and os.environ.get("TERM") != "dumb":
+                conversation.title = lambda busy: (sys.stdout.write(title_sequence(busy, cwd)), sys.stdout.flush())
+            run_plain(conversation)
+    finally:
+        try:
+            conversation.close()  # a Ctrl+C still cuts short its wait for an interrupted turn
+        finally:
+            # Ignored from here on, not restored, and before any line that may fail once the terminal
+            # is gone: a signal the guardian relays late must neither cut the session lines nor end
+            # the run by default action (Python gives its own handlers back the default one as it
+            # shuts down; it leaves an ignored signal alone).
+            for number in stops:
+                signal.signal(number, signal.SIG_IGN)
+        if session.session_id:
+            print(f"\nSession : {session.session_id}")
+            print(f"Dans Claude Code : claude --resume {session.session_id}")
+            print(f"Sur le crédit : claude-credit -r {session.session_id}")
+    return 0
+
+
+def prctl(option, value):
+    """Linux prctl(2) on this process; False where it is missing or refused."""
+    try:
+        return ctypes.CDLL(None).prctl(option, value, 0, 0, 0) == 0
+    except AttributeError:
+        return False
+
+
+def become_subreaper():
+    """Orphaned descendants come back to this process instead of init: Linux 5.3 and later, else False."""
+    try:
+        os.close(os.pidfd_open(os.getpid()))  # the sweep signals through pidfds (Linux 5.3)
+        os.stat("/proc/self/stat")  # and finds what to signal in /proc, absent from a bare chroot
+    except (AttributeError, OSError):
+        return False
+    return prctl(PR_SET_CHILD_SUBREAPER, 1)
+
+
+def parse_stat(text):
+    """(parent pid, name, state, start time, threads) from the text of /proc/<pid>/stat."""
+    # The name sits between the first "(" and the last ")", and may hold spaces and both.
+    head, _, rest = text.rpartition(")")
+    fields = rest.split()
+    return int(fields[1]), head.partition("(")[2], fields[0], int(fields[19]), int(fields[17])
+
+
+def read_stat(pid):
+    with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+        return parse_stat(fh.read())
+
+
+def processes():
+    """{pid: (parent pid, name, start time)} of every live process, zombies left out (Linux /proc)."""
+    table = {}
+    for entry in os.listdir("/proc"):
+        if not (entry.isascii() and entry.isdigit()):  # isdigit() alone takes "²"
+            continue
+        try:
+            parent, name, state, start, threads = read_stat(entry)
+        except (OSError, ValueError, IndexError):
+            continue  # ended meanwhile, or unreadable: one entry must not cost the whole scan
+        # A process whose main thread ended shows as a zombie while its other threads still run.
+        if state not in ("Z", "X") or threads > 1:
+            table[int(entry)] = (parent, name, start)
+    return table
+
+
+def descendants(parents, root, skip=()):
+    """The pids below `root` in a {pid: parent pid} map, each once, never `root` itself.
+
+    The pids in `skip`, and those below them, are left out.
+    """
+    children = collections.defaultdict(list)
+    for pid, parent in parents.items():
+        if pid not in skip:
+            children[parent].append(pid)
+    found, todo = set(), [root]
+    while todo:
+        for pid in children.pop(todo.pop(), ()):
+            found.add(pid)
+            todo.append(pid)
+    return found - {root}  # a scan racing a pid's reuse may draw a loop back to it
+
+
+def signal_process(pid, start, *signals):
+    """Send `signals` to `pid` if it is still the process that started at `start`: True once sent,
+    None when refused (another user's process), False when it is gone."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return False  # already gone
+    try:
+        # Read with the pidfd held: a pid freed and taken by another process since the scan shows
+        # another start time, and the pidfd never follows the pid to a new process.
+        if read_stat(pid)[3] != start:
+            return False
+        for number in signals:
+            signal.pidfd_send_signal(fd, number)
+        return True
+    except PermissionError:
+        return None
+    except OSError:
+        return False  # ended meanwhile
+    finally:
+        os.close(fd)
+
+
+def reap_children(run):
+    """Collect every child that ended: the wait status of `run` if it was among them (else None),
+    and whether this process still has a child."""
+    status = None
+    while True:
+        try:
+            pid, code = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return status, False
+        if pid == 0:
+            return status, True
+        if pid == run:
+            status = code
+
+
+def say(line, wait=None):
+    """One guardian line on stderr, unbuffered: a closed terminal or pipe must not change the exit code.
+
+    Given `wait`, a stderr that cannot take the line within `wait` seconds (output stopped by
+    Ctrl+S, a pipe nobody reads) is not waited for: the line is dropped. True once written.
+    """
+    with contextlib.suppress(OSError):
+        if wait is None or select.select([], [2], [], wait)[1]:
+            os.write(2, (line + "\n").encode())
+            return True
+    return False
+
+
+def label(name):
+    """A process name as one item of a line: a process chooses its own, line breaks and escapes included."""
+    return " ".join(clean(name).split()) or "(sans nom)"
+
+
+def counted(names):
+    """`names` as "sleep ×2, claude", counted as they are shown."""
+    return ", ".join(name if count == 1 else f"{name} ×{count}"
+                     for name, count in collections.Counter(map(label, names)).items())
+
+
+def end_leftovers(grace=SWEEP_GRACE, kept=frozenset()):
+    """End every process still below this one: SIGTERM, SIGKILL past `grace`, given up past twice that.
+
+    `kept` holds the (pid, start time) of the children this process had before the run: they,
+    and what runs below them, are left alone. Returns the names of those ended and {pid: name}
+    of those still alive. Each round scans again: a dying parent hands its children back to
+    this process, and one may fork meanwhile.
+    """
+    began, signalled, refused, pause, empty, told = time.monotonic(), {}, set(), 0.05, 0, False
+    while True:
+        if not reap_children(None)[1]:
+            # Exact, where a scan is not: below a subreaper, every process descends from a child of it.
+            return list(signalled.values()), {}
+        table = processes()
+        own = {pid for pid, entry in table.items() if (pid, entry[2]) in kept}
+        below = descendants({pid: entry[0] for pid, entry in table.items()}, os.getpid(), own)
+        # Another user's (sudo): no signal will ever reach it, so it is not waited for.
+        waiting = [pid for pid in below if (pid, table[pid][2]) not in refused]
+        waited = time.monotonic() - began
+        # Children kept from before the run never let the test above pass: there, two empty scans
+        # in a row stand in for it (a process that forked, then ended while /proc was read, shows
+        # as a zombie and hides its child from that one scan).
+        empty = 0 if below else empty + 1
+        if (empty == 2 and own) or (below and not waiting) or waited > 2 * grace:
+            alive = {pid: table[pid][1] for pid in below}
+            return [name for (pid, _), name in signalled.items() if pid not in alive], alive
+        if waiting and waited > 0.5 and not told:
+            told = True  # its signals are blocked: Ctrl+C cannot cut this wait short, so say it
+            say(f"claude-credit : attente de la fin de {counted(table[pid][1] for pid in waiting)}"
+                f" (SIGKILL au bout de {grace} s).", wait=0)  # stopped output must not hold the SIGKILL back
+        for pid in waiting:
+            _, name, start = table[pid]
+            # One SIGTERM each from here, as systemd sends a unit's processes (a parent may pass
+            # its own on), and SIGCONT with it: a stopped process acts on SIGTERM only once continued.
+            if waited > grace or (pid, start) not in signalled:
+                signals = (signal.SIGKILL,) if waited > grace else (signal.SIGTERM, signal.SIGCONT)
+                sent = signal_process(pid, start, *signals)
+                if sent:
+                    signalled[pid, start] = name
+                elif sent is None:
+                    refused.add((pid, start))
+        time.sleep(pause)
+        pause = min(pause * 1.5, 0.5)  # quick for what ends at once, sparing for what holds on
+
+
+def signal_line(status):
+    """The guardian's line for a run a signal ended; None when the run exited."""
+    if not os.WIFSIGNALED(status):
+        return None
+    number = os.WTERMSIG(status)
+    try:
+        name = signal.Signals(number).name
+    except ValueError:
+        name = str(number)  # a real-time signal
+    return f"claude-credit : la séance a été arrêtée par le signal {name}."
+
+
+def leftover_report(ended, alive):
+    """The guardian's lines on what the run left: none when it left nothing running."""
+    lines = []
+    if ended:
+        stopped = "arrêtés" if len(ended) > 1 else "arrêté"
+        lines.append(f"claude-credit : {stopped} en fin de séance : {counted(ended)}.")
+    if alive:
+        names = ", ".join(f"{label(name)} (pid {pid})" for pid, name in sorted(alive.items()))
+        held = "impossibles à arrêter (ils ont" if len(alive) > 1 else "impossible à arrêter (il a"
+        lines.append(f"claude-credit : {held} peut-être la clé) : {names}.")
+    return lines
+
+
+def relays(number, code):
+    """Whether the guardian passes a signal on to the run.
+
+    What a process sent (SI_USER and kin, code <= 0) went to the guardian alone, or to its group.
+    What the terminal sends (SI_KERNEL) went to its whole foreground group, the run included,
+    except a hangup's SIGHUP: that goes to the session leader alone, the guardian where it leads
+    the session (tmux new-window, ssh -t, xterm -e).
+    """
+    return code <= 0 or number == signal.SIGHUP
+
+
+def tty_mode(mode=None):
+    """The controlling terminal's mode, or, given `mode`, set it back to that; None without a terminal.
+
+    The terminal is /dev/tty, not stdin: the key prompt reads it with stdin piped. It is set
+    back from the foreground only: in the background, it belongs to another job. Left raw, it
+    still shows a display killed mid-run: what lies from the cursor's line down (the input
+    line, the bottom of its box, the status line) is cleared first, or the lines that follow
+    would be written into it; the box's top border and the lines above stay.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return None
+    try:
+        if mode is None:
+            return termios.tcgetattr(fd)
+        if os.tcgetpgrp(fd) == os.getpgrp():
+            if not termios.tcgetattr(fd)[3] & termios.ICANON:
+                os.write(fd, b"\r\x1b[J")  # the start of the line, then clear down to the bottom
+            termios.tcsetattr(fd, termios.TCSANOW, mode)
+        return mode
+    except (termios.error, OSError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def guarded(run):
+    """Run `run` in a child process, then end every process it left, however it ended.
+
+    Every process the run starts carries the key, and no process can take it back from
+    another: ending them is the only way to leave none behind. This process waits above the
+    run as a child subreaper, so orphans come back to it rather than to init, and it outlives
+    a run killed by SIGKILL. Where it cannot be a subreaper, `run` runs as before, unguarded.
+    """
+    if not become_subreaper():
+        return run()
+    # Inherited as ignored, it would have the kernel reap children unseen, the run's exit lost.
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    mode = tty_mode()  # the terminal as the run finds it
+    guardian = os.getpid()
+    # Children it had before exec (`daemon & exec claude-credit`) were never the run's: left alone.
+    kept = {(pid, entry[2]) for pid, entry in processes().items() if entry[0] == guardian}
+    # Frozen, what is loaded so far stays out of the run's collections: the collector would write
+    # to every object, and the run would copy for itself the pages it shares with this process.
+    gc.freeze()
+    watched = {*FORWARDED, signal.SIGCHLD}
+    # Nothing is lost from here to sigwaitinfo. Blocked only now: a Ctrl+C typed until here still
+    # ends the start, where blocked it would reach the guardian alone and be dropped as the terminal's.
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+    try:
+        child = os.fork()
+    except OSError:  # a process limit reached: run as before rather than not at all
+        prctl(PR_SET_CHILD_SUBREAPER, 0)
+        gc.unfreeze()
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        return run()
+    if child == 0:
+        # Should the guardian die first (kill -9), the run closes as on a hangup: claude ends, and
+        # with it the commands it tracks; what left its tree is no longer swept. Until main() takes
+        # SIGHUP over, its default action does it, not an ignored one handed down (nohup).
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        prctl(PR_SET_PDEATHSIG, signal.SIGHUP)
+        if os.getppid() != guardian:  # it died before that line
+            os.kill(os.getpid(), signal.SIGHUP)
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        return run()
+    status = None
+    while status is None:
+        info = signal.sigwaitinfo(watched)
+        if info.si_signo == signal.SIGCHLD:
+            status = reap_children(child)[0]
+        elif relays(info.si_signo, info.si_code):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child, info.si_signo)
+    # The ending signals stay blocked through the sweep; job control would still stop it (Ctrl+Z
+    # while it waits), what the run left keeping the key until `fg`. Nothing is left to suspend.
+    for number in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU):
+        signal.signal(number, signal.SIG_IGN)
+    if mode is not None:
+        # Killed in the terminal display, the run leaves the terminal raw; a SIGINT twin at the key
+        # prompt can cut getpass short of turning echo back on. A shell restores the terminal after
+        # a job killed by a signal, but it sees this process exit: restore it here, however the run
+        # ended (after a clean end, the run has already left it so).
+        tty_mode(mode)
+    ending = signal_line(status)
+    # Said before the sweep (said after a wait for SIGKILL, it would read as its outcome), unless
+    # stderr cannot take it at once: output stopped by Ctrl+S must not hold the sweep back.
+    late = [ending] if ending and not say(ending, wait=0) else []
+    try:
+        ended, alive = end_leftovers(kept=kept)
+    except Exception as err:  # the sweep is best effort: whatever failed, the run's code is still due
+        late.append(f"claude-credit : la recherche des processus laissés par la séance a échoué"
+                    f" ({type(err).__name__} : {clean(str(err))}) ; ils ont peut-être la clé.")
+        ended, alive = [], {}
+    for line in late + leftover_report(ended, alive):
+        say(line)
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(guarded(lambda: main(sys.argv[1:])))
+    except KeyboardInterrupt:
+        sys.exit(130)
